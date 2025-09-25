@@ -1,6 +1,6 @@
 use std::net::ToSocketAddrs;
 use std::sync::mpsc::channel;
-use std::{error::Error, net::IpAddr};
+use std::error::Error;
 
 use clap::Parser;
 

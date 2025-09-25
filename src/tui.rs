@@ -1,8 +1,8 @@
-use std::{io, net::ToSocketAddrs, sync::mpsc::{Receiver, Sender}, time::{Duration, Instant}, cmp::max};
+use std::{io, net::ToSocketAddrs, sync::mpsc::Receiver, time::{Duration, Instant}};
 use crate::tokad::{Node, StateRef};
 
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyModifiers}, layout::{Constraint, Layout}, text::{Line, Text}, widgets::{List, ListDirection, Paragraph, Wrap}, DefaultTerminal, Frame
+    crossterm::event::{self, Event, KeyCode, KeyModifiers}, layout::{Constraint, Layout}, text::{Line, Text}, widgets::{Paragraph, Wrap}, DefaultTerminal, Frame
 };
 use tokio::task::{spawn_blocking, JoinHandle};
 use tui_input::backend::crossterm::EventHandler;
