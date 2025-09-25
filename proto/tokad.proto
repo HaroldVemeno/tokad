@@ -1,0 +1,51 @@
+syntax = "proto3";
+package tokad;
+
+message Stub {
+  uint32 id = 1;
+  uint32 port = 2;
+}
+
+message Ping {
+  optional Stub source = 1;
+}
+message Pong {
+  optional Stub source = 1;
+}
+
+message Store {
+  optional Stub source = 1;
+  uint32 key = 2;
+  bytes value = 3;
+}
+
+message Key {
+  optional Stub source = 1;
+  uint32 key = 2;
+}
+
+message Node {
+  uint32 id = 1;
+  string ip = 2;
+  uint32 port = 3;
+}
+
+message Nodes {
+  optional Stub source = 1;
+  repeated Node nodes = 2;
+}
+
+message StoreOrNodes {
+  oneof oneof {
+    Nodes nodes = 1;
+    Store store = 2;
+  }
+}
+
+service Tokad {
+  rpc ping(Ping) returns (Pong);
+  rpc store(Store) returns (Pong);
+  rpc find_node(Key) returns (Nodes);
+  rpc find_value(Key) returns (StoreOrNodes);
+}
+

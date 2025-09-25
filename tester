@@ -1,0 +1,49 @@
+#!/bin/sh
+
+IP="[::1]:50051"
+GRPCURL="grpcurl -plaintext -proto proto/tokad.proto"
+
+while true; do
+case "$1" in
+    -6)
+        IP="[::1]:50051"
+        shift
+        ;;
+    -4)
+        IP="127.0.0.1:50051"
+        shift
+        ;;
+    ping)
+        REQ=""
+        [ -n "$2" ] && REQ="\"id\": $2"
+        $GRPCURL -d "{$REQ}" "$IP" tokad.Tokad.ping
+        exit $?
+        ;;
+    store)
+        VALUE="$(echo "$3" | base64)"
+        REQ="\"key\": $2, \"value\": \"$VALUE\""
+        [ -n "$4" ] && REQ="$REQ,\"id\": $4"
+        $GRPCURL -d "{$REQ}" $IP tokad.Tokad.store
+        exit $?
+        ;;
+    find_value)
+        REQ="\"key\": $2"
+        [ -n "$3" ] && REQ="$REQ,\"id\": $3"
+        RES="$($GRPCURL -d "{$REQ}" $IP tokad.Tokad.find_value)"
+        # echo "$RES"
+        echo "$RES" | jq
+        echo "$RES" | jq 'select(has("store")).store.value | @base64d'
+        exit $?
+        ;;
+    find_node)
+        REQ="\"key\": $2"
+        [ -n "$3" ] && REQ="$REQ,\"id\": $3"
+        $GRPCURL -d "{$REQ}" $IP tokad.Tokad.find_node | jq
+        exit $?
+        ;;
+    *)
+        echo "Bad args"
+        exit 1
+        ;;
+esac
+done
