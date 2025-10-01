@@ -18,7 +18,9 @@ struct Args {
 
     seed: Option<String>,
     #[arg(short, long)]
-    verbose: bool
+    verbose: bool,
+    #[arg(short, long)]
+    daemon: bool
 }
 
 #[tokio::main]
@@ -37,9 +39,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => None
     };
 
-    let (con_snd, con_rcv) = channel();
-    let (state, _server_handle) = start_server(args.port, Some(con_snd), seed)?;
-    let console_handle = start_console(Some(state), Some(con_rcv));
-    console_handle.await??;
+    if args.daemon {
+        let (_state, server_handle) = start_server(args.port, None, seed)?;
+            server_handle.await??;
+    } else {
+        let (con_snd, con_rcv) = channel();
+        let (state, _server_handle) = start_server(args.port, Some(con_snd), seed)?;
+        let console_handle = start_console(Some(state), Some(con_rcv));
+        console_handle.await??;
+    }
+
     Ok(())
 }
