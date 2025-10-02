@@ -12,13 +12,13 @@ pub fn start_console(state: Option<StateRef>, rcv: Option<Receiver<String>>) -> 
     let mut con = Console::default();
     con.server = state;
     con.channel = rcv;
-    let handle = spawn_blocking(move || {
+    
+    spawn_blocking(move || {
         let mut term = ratatui::init();
         let res = con.run(&mut term);
         ratatui::restore();
         res
-    });
-    return handle;
+    })
 }
 
 #[derive(Debug, Default)]
@@ -50,16 +50,14 @@ impl Console {
             if event::poll(timeout)? {
                 let event = event::read()?;
                 if let Event::Key(key) = event {
-                    if key.code == KeyCode::Enter {
-                        if self.enter() {
+                    if key.code == KeyCode::Enter
+                        && self.enter() {
                             return Ok(());
                         }
-                    }
-                    if key.modifiers == KeyModifiers::CONTROL {
-                        if key.code == KeyCode::Char('c') {
+                    if key.modifiers == KeyModifiers::CONTROL
+                        && key.code == KeyCode::Char('c') {
                             return Ok(());
                         }
-                    }
                     self.input.handle_event(&event);
                 }
             } else {
@@ -92,7 +90,7 @@ impl Console {
         let cmd = self.input.value_and_reset();
         self.push(format!("> {}", cmd));
         let words: Vec<&str> = cmd.split_whitespace().collect();
-        if words.len() == 0 {
+        if words.is_empty() {
             return false;
         }
         match words[0] {

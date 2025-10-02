@@ -159,7 +159,7 @@ impl Deref for StateRef {
     type Target = State;
 
     fn deref(&self) -> &Self::Target {
-        &self.state
+        self.state
     }
 }
 
@@ -252,7 +252,7 @@ impl State {
     pub fn log<'a>(&self, into_msg: impl Into<String>) {
         let msg = into_msg.into();
         if let Some(console) = &self.console {
-            if let Err(_) = console.send(msg.clone()) {
+            if console.send(msg.clone()).is_err() {
                 eprintln!("{}", msg);
             }
         } else {
@@ -319,7 +319,7 @@ impl State {
         let mut first = Node::default();
         {
             let buckets = self.buckets.read().await;
-            if buckets[bid].iter().position(|n| n.id == node.id).is_none() && buckets[bid].len() == K {
+            if !buckets[bid].iter().any(|n| n.id == node.id) && buckets[bid].len() == K {
                 test = true;
                 first = buckets[bid][0].clone();
             }
@@ -341,14 +341,13 @@ impl State {
             if let Some(i) = buckets[bid].iter().position(|n| n.id == node.id) {
                 buckets[bid].remove(i);
             }
-            if test {
-                if let Some(i) = buckets[bid].iter().position(|n| n.id == first.id) {
+            if test
+                && let Some(i) = buckets[bid].iter().position(|n| n.id == first.id) {
                     buckets[bid].remove(i);
                     if alive {
                         buckets[bid].push(first);
                     }
                 }
-            }
             if buckets[bid].len() < K {
                 buckets[bid].push(node);
             }
@@ -374,7 +373,7 @@ impl StateRef {
         let mut futs = JoinSet::new();
         while futs.len() < ALPHA && !queue.is_empty() {
             let node = queue.remove(0);
-            let selfc = self.clone();
+            let selfc = *self;
             futs.spawn(async move {(node.clone(), node.find_node(selfc, key).await)});
         }
 
@@ -383,7 +382,7 @@ impl StateRef {
             match reply {
                 Ok((_, nodes)) => {
                     for new_node in nodes.nodes {
-                        if seen.iter().position(|n| n.id == new_node.id).is_none() {
+                        if !seen.iter().any(|n| n.id == new_node.id) {
                             seen.push(new_node.clone());
                             queue.insert(queue.partition_point(|n| n.id ^ key < new_node.id ^ key), new_node);
                         }
@@ -399,7 +398,7 @@ impl StateRef {
                 if finished.len() >= K && finished[K-1].id ^ key < node.id ^ key {
                     continue;
                 }
-                let selfc = self.clone();
+                let selfc = *self;
                 futs.spawn(async move {(node.clone(), node.find_node(selfc, key).await)});
             }
         }
@@ -425,7 +424,7 @@ impl StateRef {
         let mut futs = JoinSet::new();
         while futs.len() < ALPHA && !queue.is_empty() {
             let node = queue.remove(0);
-            let selfc = self.clone();
+            let selfc = *self;
             futs.spawn(async move {(node.clone(), node.find_value(selfc, key).await)});
         }
 
@@ -434,7 +433,7 @@ impl StateRef {
             match reply {
                 Ok((_, StoreOrNodes::Nodes(nodes))) => {
                     for new_node in nodes.nodes {
-                        if seen.iter().position(|n| n.id == new_node.id).is_none() {
+                        if !seen.iter().any(|n| n.id == new_node.id) {
                             seen.push(new_node.clone());
                             queue.insert(queue.partition_point(|n| n.id ^ key < new_node.id ^ key), new_node);
                         }
@@ -454,7 +453,7 @@ impl StateRef {
                 if finished.len() >= K && finished[K-1].id ^ key < node.id ^ key {
                     continue;
                 }
-                let selfc = self.clone();
+                let selfc = *self;
                 futs.spawn(async move {(node.clone(), node.find_value(selfc, key).await)});
             }
         }
@@ -478,7 +477,7 @@ impl StateRef {
         let keep_mask = if bid == 0 { 0 } else { !0u32 << (32-bid) };
         let flip_mask = 1 << (32-bid-1);
         let first = (self.id & keep_mask) | (!self.id & flip_mask);
-        let last = if bid == 31 { 0 } else { first | (!0u32 >> bid+1) };
+        let last = if bid == 31 { 0 } else { first | (!0u32 >> (bid+1)) };
         let key = rand::random_range(first..=last);
         self.lookup_node(key).await.map(|_| ())
     }
@@ -495,7 +494,7 @@ impl Tokad for StateRef {
         if let Some(Stub{id, port}) = request.get_ref().source {
             if let Some(loc) = request.remote_addr() {
                 self.log(format!("Ping: {} {} {}", id, loc.ip(), port));
-                let node = Node{id: id, ip: loc.ip().to_string(), port: port as u32};
+                let node = Node{id, ip: loc.ip().to_string(), port};
                 tokio::spawn(self.state.refresh(node));
             } else {
                 self.log(format!("Ping: {} no source addr???", id));
@@ -515,7 +514,7 @@ impl Tokad for StateRef {
         if let Some(Stub{id, port}) = request.get_ref().source {
             if let Some(loc) = request.remote_addr() {
                 self.log(format!("Source: {} {} {}", id, loc.ip(), port));
-                let node = Node{id: id, ip: loc.ip().to_string(), port: port as u32};
+                let node = Node{id, ip: loc.ip().to_string(), port};
                 tokio::spawn(self.state.refresh(node));
             } else {
                 self.log(format!("Source: {} no source addr???", id));
@@ -553,7 +552,7 @@ impl Tokad for StateRef {
         if let Some(Stub{id, port}) = request.get_ref().source {
             if let Some(loc) = request.remote_addr() {
                 self.log(format!("Source: {} {} {}", id, loc.ip(), port));
-                let node = Node{id: id, ip: loc.ip().to_string(), port: port as u32};
+                let node = Node{id, ip: loc.ip().to_string(), port};
                 tokio::spawn(self.state.refresh(node));
             } else {
                 self.log(format!("Source: {} no source addr???", id));
@@ -577,7 +576,7 @@ impl Tokad for StateRef {
         if let Some(Stub{id, port}) = request.get_ref().source {
             if let Some(loc) = request.remote_addr() {
                 self.log(format!("Source: {} {} {}", id, loc.ip(), port));
-                let node = Node{id: id, ip: loc.ip().to_string(), port: port as u32};
+                let node = Node{id, ip: loc.ip().to_string(), port};
                 tokio::spawn(self.state.refresh(node));
             } else {
                 self.log(format!("Source: {} no source addr???", id));
@@ -592,9 +591,9 @@ impl Tokad for StateRef {
         {
             let store = self.store.write().await;
             if store.contains_key(&key) {
-                self.log(format!("Value found!"));
+                self.log("Value found!".to_string());
                 return Ok(Response::new(Store{
-                    key: key,
+                    key,
                     value: store[&key].clone()
                 }.or_nodes().rep(Some(self.stub()))));
             }
