@@ -83,11 +83,13 @@ impl Key {
     }
 }
 
+/*
 impl proto::Key {
     fn unrep(self) -> (Option<Stub>, Key) {
         (self.source, Key{key: self.key})
     }
 }
+*/
 
 impl StoreOrNodes {
     fn rep(self, stub: Option<Stub>) -> proto::StoreOrNodes {
@@ -126,7 +128,7 @@ pub struct State {
 
 impl Default for State {
     fn default() -> State {
-        let id = rand::rng().random();
+        let id = rand::random_range(1 ..= u32::MAX);
         let port = 50051;
         let buckets: [Vec<Node>; 32] = array::from_fn(|_| Vec::with_capacity(K));
         let store = HashMap::<u32, Vec<u8>>::default();
@@ -209,9 +211,9 @@ impl Node {
         res
     }
 
-    async fn store(&self, state: StateRef,  key: u32, value: Vec<u8>) -> Result<Option<Stub>, Status> {
+    async fn store(&self, state: StateRef,  key: u32, value: &Vec<u8>) -> Result<Option<Stub>, Status> {
         let mut con = self.connect().await?;
-        let req = Request::new(Store{key, value}.rep(Some(state.stub())));
+        let req = Request::new(Store{key, value: value.clone()}.rep(Some(state.stub())));
 
         let res = con.store(req).await.map(|p| p.into_inner().source);
         if res.is_ok() {
@@ -262,7 +264,7 @@ impl State {
             let buckets = self.buckets.read().await;
             for (i, bt) in buckets.iter().enumerate() {
                 if !bt.is_empty() {
-                    self.log(format!("{}: {:?}", i, bt));
+                    self.log(format!("{}: {}", i, bt.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(" ")));
                 }
             }
         }
@@ -307,20 +309,17 @@ impl State {
     }
 
     async fn refresh(&self, node: Node) -> Result<(), Status> {
-        if node.id == 0 {
+        if node.id == self.id || node.id == 0 {
             return Ok(());
         }
         //self.log(format!("{:?}", node));
         let dist = node.id ^ self.id;
         let bid = dist.leading_zeros() as usize;
-        let mut seen = false;
         let mut test = false;
         let mut first = Node::default();
         {
             let buckets = self.buckets.read().await;
-            if let Some(_) = buckets[bid].iter().position(|n| n.id == node.id) {
-                seen = true;
-            } else if buckets[bid].len() == K {
+            if buckets[bid].iter().position(|n| n.id == node.id).is_none() && buckets[bid].len() == K {
                 test = true;
                 first = buckets[bid][0].clone();
             }
@@ -358,6 +357,7 @@ impl State {
 
         Ok(())
     }
+
 }
 
 pub type ServerResult = Result<(), tonic::transport::Error>;
@@ -370,7 +370,6 @@ impl StateRef {
         seen.push(Node::from_stub(self.stub(), "::1"));
         let mut finished: Vec<Node> = vec![];
         finished.push(Node::from_stub(self.stub(), "::1"));
-        let mut failed: Vec<Node> = vec![];
 
         let mut futs = JoinSet::new();
         while futs.len() < ALPHA && !queue.is_empty() {
@@ -392,7 +391,6 @@ impl StateRef {
                     finished.insert(finished.partition_point(|n| n.id ^ key < node.id ^ key), node);
                 }
                 Err(_status) => {
-                    failed.push(node.clone());
                     tokio::spawn(self.state.retire(node));
                 }
             }
@@ -423,7 +421,6 @@ impl StateRef {
         seen.push(Node::from_stub(self.stub(), "::1"));
         let mut finished: Vec<Node> = vec![];
         finished.push(Node::from_stub(self.stub(), "::1"));
-        let mut failed: Vec<Node> = vec![];
 
         let mut futs = JoinSet::new();
         while futs.len() < ALPHA && !queue.is_empty() {
@@ -449,7 +446,6 @@ impl StateRef {
                     return Ok(store.or_nodes());
                 }
                 Err(_status) => {
-                    failed.push(node.clone());
                     tokio::spawn(self.state.retire(node));
                 }
             }
