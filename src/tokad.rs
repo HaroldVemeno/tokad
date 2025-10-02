@@ -5,8 +5,8 @@ use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
+use std::fmt::{self, Display, Formatter};
 
-use rand::Rng;
 use tokio::sync::RwLock;
 use tokio::task::{JoinHandle, JoinSet};
 use tonic::transport::Endpoint;
@@ -161,6 +161,11 @@ impl Deref for StateRef {
     }
 }
 
+impl Display for Node {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "({} {} {})", self.id, self.ip, self.port)
+    }
+}
 
 impl Node {
     pub fn sock(&self) -> SocketAddr {
@@ -472,15 +477,19 @@ impl Tokad for StateRef {
         &self,
         request: Request<proto::Ping>, // Accept request of type HelloRequest
     ) -> Result<Response<proto::Pong>, Status> { // Return an instance of type HelloReply
-        self.log(format!("Request: {:?}", request));
+        //self.log(format!("Ping: {:?}", request));
 
         if let Some(Stub{id, port}) = request.get_ref().source {
-            self.log(format!("Ping Id: {}", id));
             if let Some(loc) = request.remote_addr() {
+                self.log(format!("Ping: {} {} {}", id, loc.ip(), port));
                 let node = Node{id: id, ip: loc.ip().to_string(), port: port as u32};
                 tokio::spawn(self.state.refresh(node));
+            } else {
+                self.log(format!("Ping: {} no source addr???", id));
             }
-        };
+        } else {
+            self.log("Ping");
+        }
 
         Ok(Response::new(proto::Pong{source: Some(self.stub())})) // Send back our formatted greeting
     }
@@ -488,22 +497,24 @@ impl Tokad for StateRef {
         &self,
         request: Request<proto::Store>, // Accept request of type HelloRequest
     ) -> Result<Response<proto::Pong>, Status> { // Return an instance of type HelloReply
-        self.log(format!("Request: {:?}", request));
+        //self.log(format!("Request: {:?}", request));
 
         if let Some(Stub{id, port}) = request.get_ref().source {
-            self.log(format!("Ping Id: {}",id));
             if let Some(loc) = request.remote_addr() {
+                self.log(format!("Source: {} {} {}", id, loc.ip(), port));
                 let node = Node{id: id, ip: loc.ip().to_string(), port: port as u32};
                 tokio::spawn(self.state.refresh(node));
+            } else {
+                self.log(format!("Source: {} no source addr???", id));
             }
-        };
+        }
 
         let Store{key, value} = request.into_inner().unrep().1;
 
-        self.log(format!("Key: {:?}", key));
-        self.log(format!("Value: {:?}", value));
         if let Ok(string_value) = String::from_utf8(value.clone()) {
-            self.log(format!("As str: {}", string_value));
+            self.log(format!("Store {}: {}",   key, string_value));
+        } else {
+            self.log(format!("Store {}: {:?}", key, value));
         }
 
         {
@@ -524,17 +535,22 @@ impl Tokad for StateRef {
         &self,
         request: Request<proto::Key>, // Accept request of type HelloRequest
     ) -> Result<Response<proto::Nodes>, Status> { // Return an instance of type HelloReply
-        self.log(format!("Request: {:?}", request));
+        //self.log(format!("Request: {:?}", request));
 
         if let Some(Stub{id, port}) = request.get_ref().source {
-            self.log(format!("Ping Id: {}",id));
             if let Some(loc) = request.remote_addr() {
+                self.log(format!("Source: {} {} {}", id, loc.ip(), port));
                 let node = Node{id: id, ip: loc.ip().to_string(), port: port as u32};
                 tokio::spawn(self.state.refresh(node));
+            } else {
+                self.log(format!("Source: {} no source addr???", id));
             }
-        };
+        }
 
         let key = request.get_ref().key;
+
+        self.log(format!("Find node {}", key));
+
         Ok(Response::new(Nodes{nodes: self.nearest(key).await}.rep(Some(self.stub()))))
     }
 
@@ -543,20 +559,27 @@ impl Tokad for StateRef {
         &self,
         request: Request<proto::Key>,
     ) -> Result<Response<proto::StoreOrNodes>, Status> {
-        self.log(format!("Request: {:?}", request));
+        //self.log(format!("Request: {:?}", request));
+
         if let Some(Stub{id, port}) = request.get_ref().source {
-            self.log(format!("Ping Id: {}",id));
             if let Some(loc) = request.remote_addr() {
+                self.log(format!("Source: {} {} {}", id, loc.ip(), port));
                 let node = Node{id: id, ip: loc.ip().to_string(), port: port as u32};
                 tokio::spawn(self.state.refresh(node));
+            } else {
+                self.log(format!("Source: {} no source addr???", id));
             }
-        };
+        }
+
+        let key = request.get_ref().key;
+
+        self.log(format!("Find value {}", key));
 
         let key = request.get_ref().key;
         {
             let store = self.store.write().await;
             if store.contains_key(&key) {
-                self.log(format!("Key found!"));
+                self.log(format!("Value found!"));
                 return Ok(Response::new(Store{
                     key: key,
                     value: store[&key].clone()
