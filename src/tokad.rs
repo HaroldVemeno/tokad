@@ -465,6 +465,23 @@ impl StateRef {
         Ok(Nodes{nodes: finished}.or_store())
     }
 
+    pub async fn lookup_and_store(&self, key: u32, value: &Vec<u8>) -> Result<(), Box<dyn Error>> {
+        let close = self.lookup_node(key).await?;
+        for node in close {
+            node.store(*self, key, value).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn refresh_buckets(&self, bid: usize) -> Result<(), Box<dyn Error>> {
+        let keep_mask = if bid == 0 { 0 } else { !0u32 << (32-bid) };
+        let flip_mask = 1 << (32-bid-1);
+        let first = (self.id & keep_mask) | (!self.id & flip_mask);
+        let last = if bid == 31 { 0 } else { first | (!0u32 >> bid+1) };
+        let key = rand::random_range(first..=last);
+        self.lookup_node(key).await.map(|_| ())
+    }
 }
 
 #[tonic::async_trait]
@@ -620,6 +637,20 @@ pub fn start_server(port: u16, console: Option<Sender<String>>, seed: Option<Soc
                         state_ref.log("init lookup failed");
                         return;
                     };
+                    let mut last = 0;
+                    {
+                        let buckets = state_ref.buckets.read().await;
+                        for i in 0..32 {
+                            if !buckets[i].is_empty() {
+                                last = i;
+                            }
+                        }
+                    }
+                    for i in 0..last {
+                        if let Err(e) = state_ref.refresh_buckets(i).await {
+                            state_ref.log(format!("init refresh error: {}", e));
+                        };
+                    }
                     state_ref.log_buckets().await;
                 }
                 Ok(None) => {

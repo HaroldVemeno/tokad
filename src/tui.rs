@@ -92,6 +92,9 @@ impl Console {
         let cmd = self.input.value_and_reset();
         self.push(format!("> {}", cmd));
         let words: Vec<&str> = cmd.split_whitespace().collect();
+        if words.len() == 0 {
+            return false;
+        }
         match words[0] {
             "quit" | "exit" => {
                 return true;
@@ -175,6 +178,23 @@ impl Console {
                     tokio::spawn(async move {
                         server.store.write().await.insert(key, value);
                         server.log("Stored".to_string());
+                    });
+                }
+            }
+            "store" => {
+                if words.len() != 3 {
+                    self.push("Wrong argument count");
+                    return false;
+                }
+
+                let Ok(key) = words[1].parse() else {
+                    self.push("Key not parsable");
+                    return false;
+                };
+                let value = words[2].bytes().collect();
+                if let Some(server) = self.server {
+                    tokio::spawn(async move {
+                        server.log(format!("{:?}", server.lookup_and_store(key, &value).await));
                     });
                 }
             }
