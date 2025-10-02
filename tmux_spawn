@@ -1,0 +1,8 @@
+#!/bin/sh
+
+cargo build
+
+tmux set-hook -w after-split-window[21]  "select-layout tiled"
+
+(sleep 0.2; seq 50052 $((50050 + $1)) | xargs -I X tmux splitw "./target/debug/tokad X localhost:50051") &
+./target/debug/tokad 50051
