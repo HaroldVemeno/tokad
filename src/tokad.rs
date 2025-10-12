@@ -38,7 +38,7 @@ pub struct Store {
 
 #[derive(Debug, Clone)]
 pub struct Nodes {
-    nodes: Vec<Node>
+    pub nodes: Vec<Node>
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +160,17 @@ impl Deref for StateRef {
 
     fn deref(&self) -> &Self::Target {
         self.state
+    }
+}
+
+impl Display for Store {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        if let Ok(s) = str::from_utf8(&self.value) {
+            write!(f, "{}: {}", self.key, s)?;
+        } else {
+            write!(f, "{}: {:?}", self.key, self.value)?;
+        }
+        Ok(())
     }
 }
 

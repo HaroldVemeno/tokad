@@ -1,5 +1,5 @@
 use std::{io, net::ToSocketAddrs, sync::mpsc::Receiver, time::{Duration, Instant}};
-use crate::tokad::{Node, StateRef};
+use crate::tokad::{Data, Node, Nodes, StateRef, Store, StoreOrNodes};
 
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyModifiers}, layout::{Constraint, Layout}, text::{Line, Text}, widgets::{Paragraph, Wrap}, DefaultTerminal, Frame
@@ -66,13 +66,13 @@ impl Console {
         }
     }
 
-    fn render(&self, frame: &mut Frame) {
+    fn render(&mut self, frame: &mut Frame) {
         let [log_area, input_area] = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Length(1),
         ]).areas(frame.area());
 
-        let text = Text::from_iter(self.log.iter().map(|s| Line::raw(s.clone())));
+        let text = Text::from_iter(self.log.iter().map(|s| Line::raw(s)));
         let log = Paragraph::new(text)
                             .wrap(Wrap{trim: true});
         let log_height = log.line_count(log_area.width);
@@ -155,7 +155,19 @@ impl Console {
                 };
                 if let Some(server) = self.server {
                     tokio::spawn(async move {
-                        server.log(format!("Lookup result: {:?}", (server.lookup_value(key).await)));
+                        match server.lookup_value(key).await {
+                            Ok(StoreOrNodes::Store(store)) => {
+                                server.log(format!("{}", store));
+                            }
+                            Ok(StoreOrNodes::Nodes(nodes)) => {
+                                server.log(format!("{}",
+                                        nodes.nodes.iter()
+                                             .map(|n| n.to_string())
+                                             .collect::<Vec<_>>()
+                                             .join(" ")));
+                            }
+                            Err(e) => server.log(format!("{}", e))
+                        }
                     });
                 } else {
                     self.push("Server is not available");
