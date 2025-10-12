@@ -105,7 +105,7 @@ impl Console {
                     self.push("Wrong argument count");
                     return false;
                 }
-                let Ok(mut socks) = words[1].to_socket_addrs() else {
+                let Ok(mut socks) = words[1].to_socket_addrs().or_else(|_| (words[1], 50051).to_socket_addrs()) else {
                     self.push("Unparseable location");
                     return false;
                 };

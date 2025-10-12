@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let seed = match args.seed {
         Some(seed) => {
-            let addrs : Vec<_> = seed.to_socket_addrs()?.collect();
+            let addrs : Vec<_> = seed.to_socket_addrs().or_else(|_| (seed, 50051).to_socket_addrs())?.collect();
             if addrs.is_empty() {
                 return Err("Init address cannot be resolved".into());
             }
@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     if args.daemon {
         let (_state, server_handle) = start_server(args.port, None, seed)?;
-            server_handle.await??;
+        server_handle.await??;
     } else {
         let (con_snd, con_rcv) = channel();
         let (state, _server_handle) = start_server(args.port, Some(con_snd), seed)?;
