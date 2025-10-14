@@ -1,5 +1,5 @@
-use std::{cmp::max, io, net::ToSocketAddrs, sync::mpsc::Receiver, time::{Duration, Instant}};
-use crate::tokad::{Data, Node, Nodes, StateRef, Store, StoreOrNodes};
+use std::{io, net::ToSocketAddrs, sync::mpsc::Receiver, time::{Duration, Instant}};
+use crate::tokad::{Data, Node, StateRef, StoreOrNodes};
 
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyModifiers}, layout::{Constraint, Layout}, text::{Line, Text}, widgets::{Paragraph, Wrap}, DefaultTerminal, Frame

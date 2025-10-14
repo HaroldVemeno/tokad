@@ -3,7 +3,6 @@ use std::sync::mpsc::channel;
 use std::error::Error;
 
 use clap::Parser;
-use tokio::join;
 
 mod tokad;
 mod tui;
