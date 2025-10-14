@@ -3,6 +3,7 @@ use std::sync::mpsc::channel;
 use std::error::Error;
 
 use clap::Parser;
+use tokio::join;
 
 mod tokad;
 mod tui;
@@ -40,11 +41,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     if args.daemon {
-        let (_state, server_handle) = start_server(args.port, None, seed)?;
+        let (_state, server_handle, _loop_handle) = start_server(args.port, None, seed)?;
         server_handle.await??;
     } else {
         let (con_snd, con_rcv) = channel();
-        let (state, _server_handle) = start_server(args.port, Some(con_snd), seed)?;
+        let (state, _server_handle, _loop_handle) = start_server(args.port, Some(con_snd), seed)?;
         let console_handle = start_console(Some(state), Some(con_rcv));
         console_handle.await??;
     }

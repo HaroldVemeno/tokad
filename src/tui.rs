@@ -1,4 +1,4 @@
-use std::{io, net::ToSocketAddrs, sync::mpsc::Receiver, time::{Duration, Instant}};
+use std::{cmp::max, io, net::ToSocketAddrs, sync::mpsc::Receiver, time::{Duration, Instant}};
 use crate::tokad::{Data, Node, Nodes, StateRef, Store, StoreOrNodes};
 
 use ratatui::{
@@ -7,6 +7,8 @@ use ratatui::{
 use tokio::task::{spawn_blocking, JoinHandle};
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
+
+const FPS: f64 = 60.0;
 
 pub fn start_console(state: Option<StateRef>, rcv: Option<Receiver<String>>) -> JoinHandle<Result<(), io::Error>> {
     let mut con = Console::default();
@@ -35,20 +37,26 @@ impl Console {
     }
 
     fn run(mut self, term: &mut DefaultTerminal) -> io::Result<()> {
-        let tick_time = Duration::from_millis(100);
+        let tick_time = Duration::from_secs_f64(1.0 / FPS);
         let mut last_tick = Instant::now();
+        let mut change = true;
         loop {
             if self.channel.is_some() {
                 while let Some(Ok(msg)) = self.channel.as_mut().map(|o| o.try_recv()) {
                     self.push(msg);
+                    change = true;
                 }
             }
 
-            term.draw(|frame| self.render(frame))?;
+            if change {
+                term.draw(|frame| self.render(frame))?;
+                change = false;
+            }
 
             let timeout = tick_time.saturating_sub(last_tick.elapsed());
             if event::poll(timeout)? {
                 let event = event::read()?;
+                change = true;
                 if let Event::Key(key) = event {
                     if key.code == KeyCode::Enter
                         && self.enter() {
@@ -72,7 +80,9 @@ impl Console {
             Constraint::Length(1),
         ]).areas(frame.area());
 
-        let text = Text::from_iter(self.log.iter().map(|s| Line::raw(s)));
+        let rows = log_area.height as usize;
+        let start = self.log.len().saturating_sub(rows + 5);
+        let text = Text::from_iter(self.log[start..].iter().map(|s| Line::raw(s)));
         let log = Paragraph::new(text)
                             .wrap(Wrap{trim: true});
         let log_height = log.line_count(log_area.width);

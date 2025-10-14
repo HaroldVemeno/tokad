@@ -693,7 +693,7 @@ impl Tokad for StateRef {
 
 
 pub fn start_server(port: u16, console: Option<Sender<String>>, seed: Option<SocketAddr>)
-    -> Result<(StateRef, JoinHandle<ServerResult>), Box<dyn Error>> {
+    -> Result<(StateRef, JoinHandle<ServerResult>, JoinHandle<Box<dyn Error + Send>>), Box<dyn Error>> {
     let bind_ip = "::".parse()?;
     let bind_addr = SocketAddr::new(bind_ip, port);
     let state = Box::leak(Box::new(State::default()));
@@ -707,7 +707,7 @@ pub fn start_server(port: u16, console: Option<Sender<String>>, seed: Option<Soc
     //     .add_service(TokadServer::new(state.clone()))
     //     .serve(addr4);
 
-    let handle = tokio::spawn(
+    let server_handle = tokio::spawn(
         Server::builder()
                .add_service(TokadServer::new(state_ref))
                .serve(bind_addr));
@@ -835,7 +835,7 @@ pub fn start_server(port: u16, console: Option<Sender<String>>, seed: Option<Soc
     // let _ = r4?;
     // let _ = r6?;
 
-    Ok((state_ref, handle))
+    Ok((state_ref, server_handle, time_loop_handle))
 }
 
 
