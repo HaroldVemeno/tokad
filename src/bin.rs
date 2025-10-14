@@ -1,14 +1,14 @@
+use std::error::Error;
 use std::net::ToSocketAddrs;
 use std::sync::mpsc::channel;
-use std::error::Error;
 
 use clap::Parser;
 
 mod tokad;
 mod tui;
 
-use crate::tui::start_console;
 use crate::tokad::start_server;
+use crate::tui::start_console;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -20,23 +20,25 @@ struct Args {
     #[arg(short, long)]
     verbose: bool,
     #[arg(short, long)]
-    daemon: bool
+    daemon: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-
     let args = Args::parse();
 
     let seed = match args.seed {
         Some(seed) => {
-            let addrs : Vec<_> = seed.to_socket_addrs().or_else(|_| (seed, 50051).to_socket_addrs())?.collect();
+            let addrs: Vec<_> = seed
+                .to_socket_addrs()
+                .or_else(|_| (seed, 50051).to_socket_addrs())?
+                .collect();
             if addrs.is_empty() {
                 return Err("Init address cannot be resolved".into());
             }
             Some(addrs[0])
         }
-        None => None
+        None => None,
     };
 
     if args.daemon {

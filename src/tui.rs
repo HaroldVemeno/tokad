@@ -1,19 +1,41 @@
-use std::{io, net::ToSocketAddrs, sync::mpsc::Receiver, time::{Duration, Instant}};
 use crate::tokad::{Data, Node, StateRef, StoreOrNodes};
+use std::{
+    io,
+    net::ToSocketAddrs,
+    sync::mpsc::Receiver,
+    time::{Duration, Instant},
+};
 
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyModifiers}, layout::{Constraint, Layout}, text::{Line, Text}, widgets::{Paragraph, Wrap}, DefaultTerminal, Frame
+    DefaultTerminal, Frame,
+    crossterm::event::{self, Event, KeyCode, KeyModifiers},
+    layout::{Constraint, Layout},
+    text::{Line, Text},
+    widgets::{Paragraph, Wrap},
 };
-use tokio::task::{spawn_blocking, JoinHandle};
-use tui_input::backend::crossterm::EventHandler;
+use tokio::task::{JoinHandle, spawn_blocking};
 use tui_input::Input;
+use tui_input::backend::crossterm::EventHandler;
 
 const FPS: f64 = 60.0;
 
-pub fn start_console(state: Option<StateRef>, rcv: Option<Receiver<String>>) -> JoinHandle<Result<(), io::Error>> {
-    let mut con = Console::default();
-    con.server = state;
-    con.channel = rcv;
+#[derive(Debug, Default)]
+pub struct Console {
+    server: Option<StateRef>,
+    channel: Option<Receiver<String>>,
+    input: Input,
+    log: Vec<String>,
+}
+
+pub fn start_console(
+    state: Option<StateRef>,
+    rcv: Option<Receiver<String>>,
+) -> JoinHandle<Result<(), io::Error>> {
+    let con = Console {
+        server: state,
+        channel: rcv,
+        ..Console::default()
+    };
 
     spawn_blocking(move || {
         let mut term = ratatui::init();
@@ -21,14 +43,6 @@ pub fn start_console(state: Option<StateRef>, rcv: Option<Receiver<String>>) -> 
         ratatui::restore();
         res
     })
-}
-
-#[derive(Debug, Default)]
-pub struct Console {
-    server: Option<StateRef>,
-    channel: Option<Receiver<String>>,
-    input: Input,
-    log: Vec<String>
 }
 
 impl Console {
@@ -58,14 +72,12 @@ impl Console {
                 let event = event::read()?;
                 change = true;
                 if let Event::Key(key) = event {
-                    if key.code == KeyCode::Enter
-                        && self.enter() {
-                            return Ok(());
-                        }
-                    if key.modifiers == KeyModifiers::CONTROL
-                        && key.code == KeyCode::Char('c') {
-                            return Ok(());
-                        }
+                    if key.code == KeyCode::Enter && self.enter() {
+                        return Ok(());
+                    }
+                    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+                        return Ok(());
+                    }
                     self.input.handle_event(&event);
                 }
             } else {
@@ -75,25 +87,26 @@ impl Console {
     }
 
     fn render(&mut self, frame: &mut Frame) {
-        let [log_area, input_area] = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-        ]).areas(frame.area());
+        let [log_area, input_area] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
 
         let rows = log_area.height as usize;
         let start = self.log.len().saturating_sub(rows + 5);
-        let text = Text::from_iter(self.log[start..].iter().map(|s| Line::raw(s)));
-        let log = Paragraph::new(text)
-                            .wrap(Wrap{trim: true});
+        let text = Text::from_iter(self.log[start..].iter().map(Line::raw));
+        let log = Paragraph::new(text).wrap(Wrap { trim: true });
         let log_height = log.line_count(log_area.width);
-        frame.render_widget(log.scroll((log_height.saturating_sub(log_area.height as usize) as u16, 0)), log_area);
+        frame.render_widget(
+            log.scroll((
+                log_height.saturating_sub(log_area.height as usize) as u16,
+                0,
+            )),
+            log_area,
+        );
         frame.render_widget(self.input.value(), input_area);
 
         let scroll = self.input.visual_scroll(input_area.width as usize);
         let x = self.input.visual_cursor().max(scroll) - scroll;
         frame.set_cursor_position((input_area.x + x as u16, input_area.y));
-
-
     }
 
     fn enter(&mut self) -> bool {
@@ -115,7 +128,10 @@ impl Console {
                     self.push("Wrong argument count");
                     return false;
                 }
-                let Ok(mut socks) = words[1].to_socket_addrs().or_else(|_| (words[1], 50051).to_socket_addrs()) else {
+                let Ok(mut socks) = words[1]
+                    .to_socket_addrs()
+                    .or_else(|_| (words[1], 50051).to_socket_addrs())
+                else {
                     self.push("Unparseable location");
                     return false;
                 };
@@ -146,7 +162,10 @@ impl Console {
                 };
                 if let Some(server) = self.server {
                     tokio::spawn(async move {
-                        server.log(format!("Lookup result: {:?}", (server.lookup_node(key).await)));
+                        server.log(format!(
+                            "Lookup result: {:?}",
+                            (server.lookup_node(key).await)
+                        ));
                     });
                 } else {
                     self.push("Server is not available");
@@ -170,13 +189,17 @@ impl Console {
                                 server.log(format!("{}", store));
                             }
                             Ok(StoreOrNodes::Nodes(nodes)) => {
-                                server.log(format!("{}",
-                                        nodes.nodes.iter()
-                                             .map(|n| n.to_string())
-                                             .collect::<Vec<_>>()
-                                             .join(" ")));
+                                server.log(
+                                    nodes
+                                        .nodes
+                                        .iter()
+                                        .map(|n| n.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                        .to_string(),
+                                );
                             }
-                            Err(e) => server.log(format!("{}", e))
+                            Err(e) => server.log(format!("{}", e)),
                         }
                     });
                 } else {
@@ -211,7 +234,7 @@ impl Console {
                     self.push("Key not parsable");
                     return false;
                 };
-                let value = words[2].bytes().collect();
+                let value: Vec<u8> = words[2].bytes().collect();
                 if let Some(server) = self.server {
                     tokio::spawn(async move {
                         server.log(format!("{:?}", server.publish(key, &value).await));
@@ -232,10 +255,10 @@ impl Console {
                             self.push(format!("port: {}", server.port));
                         }
                         "buckets" => {
-                            tokio::spawn( async move { server.log_buckets().await } );
+                            tokio::spawn(async move { server.log_buckets().await });
                         }
                         "store" => {
-                            tokio::spawn( async move { server.log_store().await } );
+                            tokio::spawn(async move { server.log_store().await });
                         }
                         _ => {
                             self.push("Unknown thing to print");
@@ -248,7 +271,6 @@ impl Console {
             _ => {
                 self.push("Unknown command");
             }
-
         }
 
         false
