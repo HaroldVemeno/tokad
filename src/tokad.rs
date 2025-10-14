@@ -3,12 +3,14 @@ use std::array;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::fmt::{self, Display, Formatter};
 
 use tokio::sync::RwLock;
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::interval;
 use tonic::transport::Endpoint;
 use tonic::{transport::{Uri, Server, Channel}, Request, Response, Status};
 
@@ -22,6 +24,12 @@ use proto::tokad_server::{Tokad, TokadServer};
 
 const K: usize = 4;
 const ALPHA: usize = 3;
+
+const JIFFY: Duration     = Duration::from_secs(1);
+const EXPIRE: Duration    = Duration::from_secs(120);
+const REFRESH: Duration   = Duration::from_secs(30);
+const REPLICATE: Duration = Duration::from_secs(20);
+const REPUBLISH: Duration = Duration::from_secs(100);
 
 //TOOD: freeze on no connectivity?
 
@@ -72,7 +80,16 @@ impl Store {
 }
 
 impl proto::Store {
+    fn req(self, publish: bool) -> proto::StoreRequest {
+        proto::StoreRequest{source: self.source, key: self.key, value: self.value, publish}
+    }
     fn unrep(self) -> (Option<Stub>, Store) {
+        (self.source, Store{key: self.key, value: self.value})
+    }
+}
+
+impl proto::StoreRequest {
+    fn unrep(self) -> (Option<Stub>, Store){
         (self.source, Store{key: self.key, value: self.value})
     }
 }
@@ -117,12 +134,49 @@ impl proto::StoreOrNodes {
     }
 }
 
+#[derive(Debug, Clone)]
+enum DataInfo {
+    Publish(Instant), // when to republish
+    Expires(Instant) // when to expire
+}
+
+#[derive(Debug, Clone)]
+pub struct Data {
+    info: DataInfo,
+    data: Vec<u8>,
+}
+
+impl Data {
+    pub fn new(data: Vec<u8>) -> Self {
+        Data{
+            info: DataInfo::Expires(Instant::now() + EXPIRE),
+            data
+        }
+    }
+    pub fn published(data: Vec<u8>) -> Self {
+        Data{
+            info: DataInfo::Publish(Instant::now() + REPUBLISH),
+            data
+        }
+    }
+    fn refresh(&mut self) {
+        match self.info {
+            DataInfo::Expires(ref mut inst) =>
+                *inst = Instant::now() + EXPIRE,
+            _ => {}
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct State {
     pub id: u32,
     pub port: u16,
     pub buckets: RwLock<[Vec<Node>; 32]>,
-    pub store: RwLock<HashMap<u32, Vec<u8>>>,
+    refresh: RwLock<[Instant; 32]>,
+    pub store: RwLock<HashMap<u32, Data>>,
+    creation_time: Instant,
+    last_replication: AtomicU64,
     console: Option<Sender<String>>
 }
 
@@ -130,11 +184,24 @@ impl Default for State {
     fn default() -> State {
         let id = rand::random_range(1 ..= u32::MAX);
         let port = 50051;
+        let now = Instant::now();
         let buckets: [Vec<Node>; 32] = array::from_fn(|_| Vec::with_capacity(K));
-        let store = HashMap::<u32, Vec<u8>>::default();
+        let refresh: [Instant; 32] = array::from_fn(|_|
+            now + REFRESH.mul_f64(rand::random())
+        );
+        let store = HashMap::<u32, Data>::default();
         let console = None;
 
-        State{id, port, buckets: RwLock::new(buckets), store: RwLock::new(store), console}
+        State{
+            id,
+            port,
+            buckets: RwLock::new(buckets),
+            refresh: RwLock::new(refresh),
+            store: RwLock::new(store),
+            creation_time: now,
+            last_replication: AtomicU64::new(REPLICATE.mul_f64(rand::random()).as_millis().try_into().unwrap()),
+            console
+        }
     }
 }
 
@@ -222,9 +289,9 @@ impl Node {
         res
     }
 
-    async fn store(&self, state: StateRef,  key: u32, value: &Vec<u8>) -> Result<Option<Stub>, Status> {
+    async fn store(&self, state: StateRef,  key: u32, value: &Vec<u8>, publish: bool) -> Result<Option<Stub>, Status> {
         let mut con = self.connect().await?;
-        let req = Request::new(Store{key, value: value.clone()}.rep(Some(state.stub())));
+        let req = Request::new(Store{key, value: value.clone()}.rep(Some(state.stub())).req(publish));
 
         let res = con.store(req).await.map(|p| p.into_inner().source);
         if res.is_ok() {
@@ -285,7 +352,7 @@ impl State {
         {
             let store = self.store.read().await;
             for (k, v) in store.iter() {
-                if let Ok(s) = str::from_utf8(v) {
+                if let Ok(s) = str::from_utf8(&v.data) {
                     self.log(format!("{}: {}", k, s));
                 } else {
                     self.log(format!("{}: {:?}", k, v));
@@ -422,7 +489,7 @@ impl StateRef {
 
     pub async fn lookup_value(&self, key: u32) -> Result<StoreOrNodes, Box<dyn Error>> {
         if let Some(value) = self.store.read().await.get(&key) {
-            return Ok(Store{key, value: value.clone()}.or_nodes());
+            return Ok(Store{key, value: value.data.clone()}.or_nodes());
         }
 
         let mut queue: Vec<Node> = self.nearest(key).await;
@@ -475,22 +542,31 @@ impl StateRef {
         Ok(Nodes{nodes: finished}.or_store())
     }
 
-    pub async fn lookup_and_store(&self, key: u32, value: &Vec<u8>) -> Result<(), Box<dyn Error>> {
+    pub async fn lookup_and_store(&self, key: u32, value: &Vec<u8>, publish: bool) -> Result<(), Box<dyn Error>> {
         let close = self.lookup_node(key).await?;
         for node in close {
-            node.store(*self, key, value).await?;
+            node.store(*self, key, value, publish).await?;
         }
 
         Ok(())
     }
 
+    pub async fn publish(&self, key: u32, value: &Vec<u8>) -> Result<(), Box<dyn Error>> {
+        self.store.write().await.insert(key, Data::published(value.clone()));
+        self.lookup_and_store(key, value, true).await
+    }
+
     async fn refresh_buckets(&self, bid: usize) -> Result<(), Box<dyn Error>> {
+        if self.buckets.read().await[bid].is_empty() {
+            return Ok(());
+        }
         let keep_mask = if bid == 0 { 0 } else { !0u32 << (32-bid) };
-        let flip_mask = 1 << (32-bid-1);
+        let flip_mask = 1 << (31-bid);
         let first = (self.id & keep_mask) | (!self.id & flip_mask);
-        let last = if bid == 31 { 0 } else { first | (!0u32 >> (bid+1)) };
+        let last = if bid == 31 { first } else { first | (!0u32 >> (bid+1)) };
         let key = rand::random_range(first..=last);
-        self.lookup_node(key).await.map(|_| ())
+        self.lookup_node(key).await?;
+        Ok(())
     }
 }
 
@@ -518,7 +594,7 @@ impl Tokad for StateRef {
     }
     async fn store(
         &self,
-        request: Request<proto::Store>, // Accept request of type HelloRequest
+        request: Request<proto::StoreRequest>, // Accept request of type HelloRequest
     ) -> Result<Response<proto::Pong>, Status> { // Return an instance of type HelloReply
         //self.log(format!("Request: {:?}", request));
 
@@ -532,6 +608,7 @@ impl Tokad for StateRef {
             }
         }
 
+        let publish = request.get_ref().publish;
         let Store{key, value} = request.into_inner().unrep().1;
 
         if let Ok(string_value) = String::from_utf8(value.clone()) {
@@ -541,17 +618,18 @@ impl Tokad for StateRef {
         }
 
         {
-            let store = self.store.read().await;
-            if store.contains_key(&key) {
-                return Ok(Response::new(proto::Pong{source: Some(self.stub())}));
+            let mut store = self.store.write().await;
+            if let Some(val) = store.get_mut(&key) {
+                // TODO: old value check
+                if publish {
+                    val.refresh();
+                }
+            } else {
+                store.insert(key, Data::new(value));
             }
-
         }
 
-        // TODO: old value check
-        self.store.write().await.insert(key, value);
-
-        Ok(Response::new(proto::Pong{source: Some(self.stub())})) // Send back our formatted greeting
+        Ok(Response::new(proto::Pong{source: Some(self.stub())}))
     }
 
     async fn find_node(
@@ -605,7 +683,7 @@ impl Tokad for StateRef {
                 self.log("Value found!".to_string());
                 return Ok(Response::new(Store{
                     key,
-                    value: store[&key].clone()
+                    value: store[&key].data.clone()
                 }.or_nodes().rep(Some(self.stub()))));
             }
         }
@@ -647,20 +725,20 @@ pub fn start_server(port: u16, console: Option<Sender<String>>, seed: Option<Soc
                         state_ref.log("init lookup failed");
                         return;
                     };
-                    let mut last = 0;
-                    {
-                        let buckets = state_ref.buckets.read().await;
-                        for i in 0..32 {
-                            if !buckets[i].is_empty() {
-                                last = i;
-                            }
-                        }
-                    }
-                    for i in 0..last {
-                        if let Err(e) = state_ref.refresh_buckets(i).await {
-                            state_ref.log(format!("init refresh error: {}", e));
-                        };
-                    }
+                    // let mut last = 0;
+                    // {
+                    //     let buckets = state_ref.buckets.read().await;
+                    //     for i in 0..32 {
+                    //         if !buckets[i].is_empty() {
+                    //             last = i;
+                    //         }
+                    //     }
+                    // }
+                    // for i in 0..last {
+                    //     if let Err(e) = state_ref.refresh_buckets(i).await {
+                    //         state_ref.log(format!("init refresh error: {}", e));
+                    //     };
+                    // }
                     state_ref.log_buckets().await;
                 }
                 Ok(None) => {
@@ -672,6 +750,86 @@ pub fn start_server(port: u16, console: Option<Sender<String>>, seed: Option<Soc
             }
         });
     }
+
+    let time_loop_handle = tokio::spawn(async move {
+        let mut ticker = interval(JIFFY);
+        loop {
+            ticker.tick().await;
+
+            // refresh
+            {
+                for i in 0..32 {
+                    let now = Instant::now();
+                    let mut should_refresh = false;
+                    {
+                        let mut refresh = state_ref.refresh.write().await;
+                        if refresh[i] + REFRESH < now {
+                            refresh[i] = now;
+                            should_refresh = true;
+                        }
+                    }
+                    if should_refresh {
+                        let _ = state_ref.refresh_buckets(i).await;
+                        state_ref.log(format!("REFRESH {}", i));
+                    }
+                }
+            }
+
+            // replicate and republish
+            {
+                let now = Instant::now();
+                let elapsed = now - state_ref.creation_time;
+                let to_refr = Duration::from_millis(state_ref.last_replication.load(Ordering::Acquire)) + REPLICATE;
+                let replicate = elapsed > to_refr;
+                if replicate {
+                    state_ref.log("REPLICATE");
+                }
+                let mut expired: Vec<u32> = vec![];
+                let keys = state_ref.store.read().await.keys().cloned().collect::<Vec<_>>();
+                for k in keys {
+                    let mut expire = false;
+                    let mut publish = false;
+                    let data: Vec<u8>;
+                    {
+                        let mut store = state_ref.store.write().await;
+                        let v = store.get_mut(&k).unwrap();
+                        data = v.data.clone();
+                        let now = Instant::now();
+                        match v.info {
+                            DataInfo::Publish(ref mut when) => {
+                                if *when < now {
+                                    *when = now + REPUBLISH;
+                                    publish = true;
+                                }                             }
+                            DataInfo::Expires(when) => {
+                                if when < now {
+                                    expire = true;
+                                }
+                            }
+                        }
+                    }
+                    if expire {
+                        expired.push(k);
+                    } else if replicate || publish {
+                        let _ = state_ref.lookup_and_store(k, &data, publish).await;
+                    }
+                    if publish {
+                        state_ref.log("REPUBLISH");
+                    }
+                }
+                if replicate {
+                    state_ref.last_replication.store(elapsed.as_millis().try_into().unwrap(), Ordering::Release);
+                }
+                {
+                    let mut store = state_ref.store.write().await;
+                    for k in expired {
+                        store.remove(&k);
+                    }
+                }
+            }
+        }
+    });
+
 
     // let (r4, r6) = tokio::join!(server4, server6);
     // let _ = r4?;

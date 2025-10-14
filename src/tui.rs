@@ -12,7 +12,7 @@ pub fn start_console(state: Option<StateRef>, rcv: Option<Receiver<String>>) -> 
     let mut con = Console::default();
     con.server = state;
     con.channel = rcv;
-    
+
     spawn_blocking(move || {
         let mut term = ratatui::init();
         let res = con.run(&mut term);
@@ -186,7 +186,7 @@ impl Console {
                 let value = words[2].bytes().collect();
                 if let Some(server) = self.server {
                     tokio::spawn(async move {
-                        server.store.write().await.insert(key, value);
+                        server.store.write().await.insert(key, Data::new(value));
                         server.log("Stored".to_string());
                     });
                 }
@@ -204,7 +204,7 @@ impl Console {
                 let value = words[2].bytes().collect();
                 if let Some(server) = self.server {
                     tokio::spawn(async move {
-                        server.log(format!("{:?}", server.lookup_and_store(key, &value).await));
+                        server.log(format!("{:?}", server.publish(key, &value).await));
                     });
                 }
             }

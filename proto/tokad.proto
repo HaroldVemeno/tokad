@@ -19,6 +19,13 @@ message Store {
   bytes value = 3;
 }
 
+message StoreRequest {
+  optional Stub source = 1;
+  uint32 key = 2;
+  bytes value = 3;
+  bool publish = 4;
+}
+
 message Key {
   optional Stub source = 1;
   uint32 key = 2;
@@ -44,7 +51,7 @@ message StoreOrNodes {
 
 service Tokad {
   rpc ping(Ping) returns (Pong);
-  rpc store(Store) returns (Pong);
+  rpc store(StoreRequest) returns (Pong);
   rpc find_node(Key) returns (Nodes);
   rpc find_value(Key) returns (StoreOrNodes);
 }
