@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::interval;
 use tonic::transport::Endpoint;
@@ -29,12 +29,10 @@ const K: usize = 4;
 const ALPHA: usize = 3;
 
 const JIFFY: Duration = Duration::from_secs(1);
-const EXPIRE: Duration = Duration::from_secs(120);
+const EXPIRE: Duration = Duration::from_secs(240);
 const REFRESH: Duration = Duration::from_secs(30);
-const REPLICATE: Duration = Duration::from_secs(20);
-const REPUBLISH: Duration = Duration::from_secs(100);
-
-//TOOD: freeze on no connectivity?
+const REPLICATE: Duration = Duration::from_secs(10);
+const REPUBLISH: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone)]
 pub struct Key {
@@ -202,9 +200,9 @@ impl Data {
 pub struct State {
     pub id: u32,
     pub port: u16,
-    pub buckets: RwLock<[Vec<Node>; 32]>,
-    refresh: RwLock<[Instant; 32]>,
-    pub store: RwLock<HashMap<u32, Data>>,
+    pub buckets: Mutex<[Vec<Node>; 32]>,
+    refresh: Mutex<[Instant; 32]>,
+    pub store: Mutex<HashMap<u32, Data>>,
     creation_time: Instant,
     last_replication: AtomicU64,
     console: Option<Sender<String>>,
@@ -223,9 +221,9 @@ impl Default for State {
         State {
             id,
             port,
-            buckets: RwLock::new(buckets),
-            refresh: RwLock::new(refresh),
-            store: RwLock::new(store),
+            buckets: Mutex::new(buckets),
+            refresh: Mutex::new(refresh),
+            store: Mutex::new(store),
             creation_time: now,
             last_replication: AtomicU64::new(
                 REPLICATE
@@ -402,7 +400,7 @@ impl State {
     }
     pub async fn log_buckets(&self) {
         {
-            let buckets = self.buckets.read().await;
+            let buckets = self.buckets.lock().await;
             for (i, bt) in buckets.iter().enumerate() {
                 if !bt.is_empty() {
                     self.log(format!(
@@ -420,7 +418,7 @@ impl State {
 
     pub async fn log_store(&self) {
         {
-            let store = self.store.read().await;
+            let store = self.store.lock().await;
             for (k, v) in store.iter() {
                 if let Ok(s) = str::from_utf8(&v.data) {
                     self.log(format!("{}: {}", k, s));
@@ -434,7 +432,7 @@ impl State {
     async fn nearest(&self, key: u32) -> Vec<Node> {
         let mut nodes: Vec<Node>;
         {
-            let buckets = self.buckets.read().await;
+            let buckets = self.buckets.lock().await;
             nodes = buckets.iter().flatten().cloned().collect();
         }
 
@@ -449,7 +447,7 @@ impl State {
         let dist = node.id ^ self.id;
         let bid = dist.leading_zeros() as usize;
         {
-            let mut buckets = self.buckets.write().await;
+            let mut buckets = self.buckets.lock().await;
             if let Some(i) = buckets[bid].iter().position(|n| n.id == node.id) {
                 buckets[bid].remove(i);
             }
@@ -466,7 +464,7 @@ impl State {
         let mut test = false;
         let mut first = Node::default();
         {
-            let buckets = self.buckets.read().await;
+            let buckets = self.buckets.lock().await;
             if !buckets[bid].iter().any(|n| n.id == node.id) && buckets[bid].len() == K {
                 test = true;
                 first = buckets[bid][0].clone();
@@ -487,7 +485,7 @@ impl State {
         }
 
         {
-            let mut buckets = self.buckets.write().await;
+            let mut buckets = self.buckets.lock().await;
             if let Some(i) = buckets[bid].iter().position(|n| n.id == node.id) {
                 buckets[bid].remove(i);
             }
@@ -564,7 +562,7 @@ impl StateRef {
     }
 
     pub async fn lookup_value(&self, key: u32) -> Result<StoreOrNodes, Box<dyn Error>> {
-        if let Some(value) = self.store.read().await.get(&key) {
+        if let Some(value) = self.store.lock().await.get(&key) {
             return Ok(Store {
                 key,
                 value: value.data.clone(),
@@ -644,14 +642,14 @@ impl StateRef {
 
     pub async fn publish(&self, key: u32, value: &[u8]) -> Result<(), Box<dyn Error>> {
         self.store
-            .write()
+            .lock()
             .await
             .insert(key, Data::published(value.to_vec()));
         self.lookup_and_store(key, value, true).await
     }
 
     async fn refresh_buckets(&self, bid: usize) -> Result<(), Box<dyn Error>> {
-        if self.buckets.read().await[bid].is_empty() {
+        if self.buckets.lock().await[bid].is_empty() {
             return Ok(());
         }
         let keep_mask = if bid == 0 { 0 } else { !0u32 << (32 - bid) };
@@ -728,7 +726,7 @@ impl Tokad for StateRef {
         }
 
         {
-            let mut store = self.store.write().await;
+            let mut store = self.store.lock().await;
             if let Some(val) = store.get_mut(&key) {
                 // TODO: old value check
                 if publish {
@@ -803,7 +801,7 @@ impl Tokad for StateRef {
 
         let key = request.get_ref().key;
         {
-            let store = self.store.write().await;
+            let store = self.store.lock().await;
             if store.contains_key(&key) {
                 self.log("Value found!".to_string());
                 return Ok(Response::new(
@@ -872,7 +870,7 @@ pub fn start_server(
                     };
                     // let mut last = 0;
                     // {
-                    //     let buckets = state_ref.buckets.read().await;
+                    //     let buckets = state_ref.buckets.lock().await;
                     //     for i in 0..32 {
                     //         if !buckets[i].is_empty() {
                     //             last = i;
@@ -907,7 +905,7 @@ pub fn start_server(
                     let now = Instant::now();
                     let mut should_refresh = false;
                     {
-                        let mut refresh = state_ref.refresh.write().await;
+                        let mut refresh = state_ref.refresh.lock().await;
                         if refresh[i] + REFRESH < now {
                             refresh[i] = now;
                             should_refresh = true;
@@ -934,7 +932,7 @@ pub fn start_server(
                 let mut expired: Vec<u32> = vec![];
                 let keys = state_ref
                     .store
-                    .read()
+                    .lock()
                     .await
                     .keys()
                     .cloned()
@@ -944,7 +942,7 @@ pub fn start_server(
                     let mut publish = false;
                     let data: Vec<u8>;
                     {
-                        let mut store = state_ref.store.write().await;
+                        let mut store = state_ref.store.lock().await;
                         let v = store.get_mut(&k).unwrap();
                         data = v.data.clone();
                         let now = Instant::now();
@@ -977,7 +975,7 @@ pub fn start_server(
                         .store(elapsed.as_millis().try_into().unwrap(), Ordering::Release);
                 }
                 {
-                    let mut store = state_ref.store.write().await;
+                    let mut store = state_ref.store.lock().await;
                     for k in expired {
                         store.remove(&k);
                     }

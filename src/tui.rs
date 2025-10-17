@@ -219,7 +219,7 @@ impl Console {
                 let value = words[2].bytes().collect();
                 if let Some(server) = self.server {
                     tokio::spawn(async move {
-                        server.store.write().await.insert(key, Data::new(value));
+                        server.store.lock().await.insert(key, Data::new(value));
                         server.log("Stored".to_string());
                     });
                 }
