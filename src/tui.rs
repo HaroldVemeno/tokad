@@ -2,7 +2,7 @@ use crate::tokad::{Data, Node, StateRef, StoreOrNodes};
 use std::{io, net::ToSocketAddrs};
 
 use futures::{FutureExt, StreamExt, future::OptionFuture};
-use tokio::{select, sync::mpsc::Receiver};
+use tokio::{select, sync::mpsc};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyModifiers};
 use ratatui::{
@@ -17,30 +17,30 @@ use tui_input::backend::crossterm::EventHandler;
 //const FPS: f64 = 60.0;
 
 #[derive(Debug, Default)]
-pub struct Console {
+pub struct Tui {
     server: Option<StateRef>,
-    channel: Option<Receiver<String>>,
+    log_recv: Option<mpsc::Receiver<String>>,
     input: Input,
     log: Vec<String>,
 }
 
-pub async fn start_console(
-    state: Option<StateRef>,
-    rcv: Option<Receiver<String>>,
+pub async fn run_tui(
+    server: Option<StateRef>,
+    log_recv: Option<mpsc::Receiver<String>>,
 ) -> Result<(), io::Error> {
-    let con = Console {
-        server: state,
-        channel: rcv,
-        ..Console::default()
+    let tui = Tui {
+        server,
+        log_recv,
+        ..Tui::default()
     };
 
     let mut term = ratatui::init();
-    let res = con.run(&mut term).await;
+    let result = tui.run(&mut term).await;
     ratatui::restore();
-    res
+    result
 }
 
-impl Console {
+impl Tui {
     async fn run(mut self, term: &mut DefaultTerminal) -> io::Result<()> {
         let mut event_stream = EventStream::new();
         loop {
@@ -48,7 +48,7 @@ impl Console {
 
             let mut log_buf = Vec::with_capacity(64);
             let log_fut: OptionFuture<_> = self
-                .channel
+                .log_recv
                 .as_mut()
                 .map(|ch| ch.recv_many(&mut log_buf, 64))
                 .into();
@@ -59,8 +59,9 @@ impl Console {
                 }
                 Some(Ok(event)) = event_stream.next().fuse() => {
                     if let Event::Key(key) = event {
-                        if key.code == KeyCode::Enter && self.enter() {
-                            return Ok(());
+                        if key.code == KeyCode::Enter {
+                            let should_exit = self.enter();
+                            if should_exit { return Ok(()); }
                         }
                         if key.modifiers == KeyModifiers::CONTROL
                             && key.code == KeyCode::Char('c') {
@@ -111,8 +112,12 @@ impl Console {
                 self.log.clear();
             }
             "ping" => {
+                let usage = |log : &mut Vec<String>| {
+                    log.push("Usage: ping <location>".to_string());
+                };
                 if words.len() != 2 {
                     self.log.push("Wrong argument count".to_string());
+                    usage(&mut self.log);
                     return false;
                 }
                 let Ok(mut socks) = words[1]
@@ -120,10 +125,12 @@ impl Console {
                     .or_else(|_| (words[1], 50051).to_socket_addrs())
                 else {
                     self.log.push("Unparseable location".to_string());
+                    usage(&mut self.log);
                     return false;
                 };
                 let Some(sock) = socks.next() else {
                     self.log.push("Not resolvable".to_string());
+                    usage(&mut self.log);
                     return false;
                 };
                 self.log.push(format!("{}", sock));
@@ -133,18 +140,23 @@ impl Console {
                         server.log(format!("{:?}", (node.ping(server).await))).await;
                     });
                 } else {
-                    self.log.push("Server is not available".to_string());
+                    self.log.push("Server is dead".to_string());
                 }
             }
 
             "lookup_node" => {
+                let usage = |log : &mut Vec<String>| {
+                    log.push("Usage: lookup_node <id>".to_string());
+                };
                 if words.len() != 2 {
                     self.log.push("Wrong argument count".to_string());
+                    usage(&mut self.log);
                     return false;
                 }
 
-                let Ok(key) = words[1].parse::<u32>() else {
+                let Ok(key) = words[1].parse::<u128>() else {
                     self.log.push("Unparseable key".to_string());
+                    usage(&mut self.log);
                     return false;
                 };
                 if let Some(server) = self.server {
@@ -157,18 +169,23 @@ impl Console {
                             .await;
                     });
                 } else {
-                    self.log.push("Server is not available".to_string());
+                    self.log.push("Server is dead".to_string());
                 }
             }
 
             "lookup" => {
+                let usage = |log : &mut Vec<String>| {
+                    log.push("Usage: lookup <key>".to_string());
+                };
                 if words.len() != 2 {
                     self.log.push("Wrong argument count".to_string());
+                    usage(&mut self.log);
                     return false;
                 }
 
-                let Ok(key) = words[1].parse::<u32>() else {
+                let Ok(key) = words[1].parse::<u128>() else {
                     self.log.push("Unparseable key".to_string());
+                    usage(&mut self.log);
                     return false;
                 };
                 if let Some(server) = self.server {
@@ -196,17 +213,22 @@ impl Console {
                         }
                     });
                 } else {
-                    self.log.push("Server is not available".to_string());
+                    self.log.push("Server is dead".to_string());
                 }
             }
             "local_store" => {
+                let usage = |log : &mut Vec<String>| {
+                    log.push("Usage: local_store <key> <value>".to_string());
+                };
                 if words.len() != 3 {
                     self.log.push("Wrong argument count".to_string());
+                    usage(&mut self.log);
                     return false;
                 }
 
                 let Ok(key) = words[1].parse() else {
                     self.log.push("Key not parsable".to_string());
+                    usage(&mut self.log);
                     return false;
                 };
                 let value = words[2].bytes().collect();
@@ -217,28 +239,56 @@ impl Console {
                     });
                 }
             }
-            "store" => {
+            "raw_store" => {
+                let usage = |log : &mut Vec<String>| {
+                    log.push("Usage: raw_store <key> <value>".to_string());
+                };
                 if words.len() != 3 {
                     self.log.push("Wrong argument count".to_string());
+                    usage(&mut self.log);
                     return false;
                 }
 
                 let Ok(key) = words[1].parse() else {
                     self.log.push("Key not parsable".to_string());
+                    usage(&mut self.log);
                     return false;
                 };
                 let value: Vec<u8> = words[2].bytes().collect();
                 if let Some(server) = self.server {
                     tokio::spawn(async move {
                         server
-                            .log(format!("{:?}", server.publish(key, &value).await))
+                            .log(format!("{:?}", server.raw_publish(key, &value).await))
+                            .await;
+                    });
+                }
+            }
+            "store" => {
+                let usage = |log : &mut Vec<String>| {
+                    log.push("Usage: raw_store <value>".to_string());
+                };
+                if words.len() != 2 {
+                    self.log.push("Wrong argument count".to_string());
+                    usage(&mut self.log);
+                    return false;
+                }
+
+                let value: Vec<u8> = words[1].bytes().collect();
+                if let Some(server) = self.server {
+                    tokio::spawn(async move {
+                        server
+                            .log(format!("Key: {}", server.publish(&value).await.unwrap()))
                             .await;
                     });
                 }
             }
             "print" => {
+                let usage = |log : &mut Vec<String>| {
+                    log.push("Usage: print id|port|buckets|store".to_string());
+                };
                 if words.len() != 2 {
                     self.log.push("Wrong argument count".to_string());
+                    usage(&mut self.log);
                     return false;
                 }
                 if let Some(server) = self.server {
@@ -257,14 +307,16 @@ impl Console {
                         }
                         _ => {
                             self.log.push("Unknown thing to print".to_string());
+                            usage(&mut self.log);
                         }
                     }
                 } else {
-                    self.log.push("Server is not available".to_string());
+                    self.log.push("Server is dead".to_string());
                 }
             }
             _ => {
                 self.log.push("Unknown command".to_string());
+                self.log.push("Commands: quit, clear, ping, print, lookup, store, lookup_node, local_store, raw_store".to_string());
             }
         }
 

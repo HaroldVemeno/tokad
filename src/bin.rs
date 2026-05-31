@@ -6,11 +6,13 @@ use clap::Parser;
 
 mod tokad;
 mod tui;
+mod data;
+mod hash;
 
 const LOG_CHANNEL_BUF: usize = 512;
 
 use crate::tokad::start_server;
-use crate::tui::start_console;
+use crate::tui::run_tui;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -27,7 +29,6 @@ struct Args {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // console_subscriber::init();
     let args = Args::parse();
 
     let seed = match args.seed {
@@ -50,8 +51,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else {
         let (con_snd, con_rcv) = channel(LOG_CHANNEL_BUF);
         let (state, _server_handle, _loop_handle) = start_server(args.port, Some(con_snd), seed)?;
-        let console_handle = start_console(Some(state), Some(con_rcv));
-        console_handle.await?;
+        run_tui(Some(state), Some(con_rcv)).await?;
     }
 
     Ok(())

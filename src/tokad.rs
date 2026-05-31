@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, mpsc::Sender};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::interval;
 use tonic::transport::Endpoint;
 use tonic::{
     Request, Response, Status,
@@ -22,157 +21,29 @@ pub mod proto {
 
 use proto::tokad_client::TokadClient;
 use proto::tokad_server::{Tokad, TokadServer};
-pub use proto::{Node, Stub};
 
+// Number of nodes in one bucket
 const K: usize = 4;
+
+// Number of concurrent requests during a recursive lookup
 const ALPHA: usize = 3;
 
 const JIFFY: Duration = Duration::from_secs(1);
-const EXPIRE: Duration = Duration::from_secs(240);
+pub const EXPIRE: Duration = Duration::from_secs(240);
 const REFRESH: Duration = Duration::from_secs(30);
 const REPLICATE: Duration = Duration::from_secs(10);
-const REPUBLISH: Duration = Duration::from_secs(120);
+pub const REPUBLISH: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone)]
-pub struct Key {
-    key: u32,
-}
-
-#[derive(Debug, Clone)]
-pub struct Store {
-    key: u32,
-    value: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Nodes {
-    pub nodes: Vec<Node>,
-}
-
-#[derive(Debug, Clone)]
-pub enum StoreOrNodes {
-    Store(Store),
-    Nodes(Nodes),
-}
-
-impl Nodes {
-    fn or_store(self) -> StoreOrNodes {
-        StoreOrNodes::Nodes(self)
-    }
-    fn rep(self, stub: Option<Stub>) -> proto::Nodes {
-        proto::Nodes {
-            source: stub,
-            nodes: self.nodes,
-        }
-    }
-}
-
-impl proto::Nodes {
-    fn unrep(self) -> (Option<Stub>, Nodes) {
-        (self.source, Nodes { nodes: self.nodes })
-    }
-}
-
-impl Store {
-    fn or_nodes(self) -> StoreOrNodes {
-        StoreOrNodes::Store(self)
-    }
-    fn rep(self, stub: Option<Stub>) -> proto::Store {
-        proto::Store {
-            source: stub,
-            key: self.key,
-            value: self.value,
-        }
-    }
-}
-
-impl proto::Store {
-    fn req(self, publish: bool) -> proto::StoreRequest {
-        proto::StoreRequest {
-            source: self.source,
-            key: self.key,
-            value: self.value,
-            publish,
-        }
-    }
-    fn unrep(self) -> (Option<Stub>, Store) {
-        (
-            self.source,
-            Store {
-                key: self.key,
-                value: self.value,
-            },
-        )
-    }
-}
-
-impl proto::StoreRequest {
-    fn unrep(self) -> (Option<Stub>, Store) {
-        (
-            self.source,
-            Store {
-                key: self.key,
-                value: self.value,
-            },
-        )
-    }
-}
-
-impl Key {
-    fn rep(self, stub: Option<Stub>) -> proto::Key {
-        proto::Key {
-            source: stub,
-            key: self.key,
-        }
-    }
-}
-
-/*
-impl proto::Key {
-    fn unrep(self) -> (Option<Stub>, Key) {
-        (self.source, Key{key: self.key})
-    }
-}
-*/
-
-impl StoreOrNodes {
-    fn rep(self, stub: Option<Stub>) -> proto::StoreOrNodes {
-        match self {
-            StoreOrNodes::Store(store) => proto::StoreOrNodes {
-                oneof: Some(proto::store_or_nodes::Oneof::Store(store.rep(stub))),
-            },
-            StoreOrNodes::Nodes(nodes) => proto::StoreOrNodes {
-                oneof: Some(proto::store_or_nodes::Oneof::Nodes(nodes.rep(stub))),
-            },
-        }
-    }
-}
-
-impl proto::StoreOrNodes {
-    fn unrep(self) -> Option<(Option<Stub>, StoreOrNodes)> {
-        Some(match self.oneof? {
-            proto::store_or_nodes::Oneof::Store(store) => {
-                let (stub, store) = store.unrep();
-                (stub, store.or_nodes())
-            }
-            proto::store_or_nodes::Oneof::Nodes(nodes) => {
-                let (stub, nodes) = nodes.unrep();
-                (stub, nodes.or_store())
-            }
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-enum DataInfo {
+pub enum DataInfo {
     Publish(Instant), // when to republish
     Expires(Instant), // when to expire
 }
 
 #[derive(Debug, Clone)]
 pub struct Data {
-    info: DataInfo,
-    data: Vec<u8>,
+    pub info: DataInfo,
+    pub data: Vec<u8>,
 }
 
 impl Data {
@@ -188,34 +59,48 @@ impl Data {
             data,
         }
     }
-    fn refresh(&mut self) {
+    pub fn refresh(&mut self) {
         if let DataInfo::Expires(ref mut inst) = self.info {
             *inst = Instant::now() + EXPIRE
         }
     }
 }
 
+impl Display for Store {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        if let Ok(s) = str::from_utf8(&self.value) {
+            write!(f, "{}: {}", self.key, s)?;
+        } else {
+            write!(f, "{}: {:?}", self.key, self.value)?;
+        }
+        Ok(())
+    }
+}
+
+use crate::hash::{ID_BITS, ID_MASK, key_hash};
+pub use crate::data::{Stub, Node, Key, Store, Nodes, StoreOrNodes};
+
 #[derive(Debug)]
 pub struct State {
-    pub id: u32,
+    pub id: u128,
     pub port: u16,
-    pub buckets: Mutex<[Vec<Node>; 32]>,
-    refresh: Mutex<[Instant; 32]>,
-    pub store: Mutex<HashMap<u32, Data>>,
+    pub buckets: Mutex<[Vec<Node>; ID_BITS]>,
+    refresh: Mutex<[Instant; ID_BITS]>,
+    pub store: Mutex<HashMap<u128, Data>>,
     creation_time: Instant,
     last_replication: AtomicU64,
-    console: Option<Sender<String>>,
+    log: Option<Sender<String>>,
 }
 
 impl Default for State {
     fn default() -> State {
-        let id = rand::random_range(1..=u32::MAX);
+        let id = rand::random_range(1..=u128::MAX) & ID_MASK;
         let port = 50051;
         let now = Instant::now();
-        let buckets: [Vec<Node>; 32] = array::from_fn(|_| Vec::with_capacity(K));
-        let refresh: [Instant; 32] = array::from_fn(|_| now + REFRESH.mul_f64(rand::random()));
-        let store = HashMap::<u32, Data>::default();
-        let console = None;
+        let buckets: [Vec<Node>; ID_BITS] = array::from_fn(|_| Vec::with_capacity(K));
+        let refresh: [Instant; ID_BITS] = array::from_fn(|_| now + REFRESH.mul_f64(rand::random()));
+        let store = HashMap::<u128, Data>::default();
+        let log = None;
 
         State {
             id,
@@ -231,7 +116,7 @@ impl Default for State {
                     .try_into()
                     .unwrap(),
             ),
-            console,
+            log,
         }
     }
 }
@@ -262,17 +147,6 @@ impl Deref for StateRef {
     }
 }
 
-impl Display for Store {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        if let Ok(s) = str::from_utf8(&self.value) {
-            write!(f, "{}: {}", self.key, s)?;
-        } else {
-            write!(f, "{}: {:?}", self.key, self.value)?;
-        }
-        Ok(())
-    }
-}
-
 impl Display for Node {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "({} {} {})", self.id, self.ip, self.port)
@@ -284,7 +158,7 @@ impl Node {
         SocketAddr::new(self.ip.parse().unwrap(), self.port.try_into().unwrap())
     }
 
-    pub fn from_sock(id: u32, sock: SocketAddr) -> Self {
+    pub fn from_sock(id: u128, sock: SocketAddr) -> Self {
         Node {
             id,
             ip: sock.ip().to_string(),
@@ -318,10 +192,10 @@ impl Node {
     pub async fn ping(&self, state: StateRef) -> Result<Option<Stub>, Status> {
         let mut con = self.connect().await?;
         let req = Request::new(proto::Ping {
-            source: Some(state.stub()),
+            source: Some(state.stub().rep()),
         });
 
-        let res = con.ping(req).await.map(|p| p.into_inner().source);
+        let res = con.ping(req).await.map(|p| p.into_inner().source.map(|s| s.unrep()));
         if res.is_ok() {
             tokio::spawn(state.state.refresh(self.clone()));
         }
@@ -331,7 +205,7 @@ impl Node {
     async fn store(
         &self,
         state: StateRef,
-        key: u32,
+        key: u128,
         value: &[u8],
         publish: bool,
     ) -> Result<Option<Stub>, Status> {
@@ -345,14 +219,14 @@ impl Node {
             .req(publish),
         );
 
-        let res = con.store(req).await.map(|p| p.into_inner().source);
+        let res = con.store(req).await.map(|p| p.into_inner().source.map(|s| s.unrep()));
         if res.is_ok() {
             tokio::spawn(state.state.refresh(self.clone()));
         }
         res
     }
 
-    async fn find_node(&self, state: StateRef, key: u32) -> Result<(Option<Stub>, Nodes), Status> {
+    async fn find_node(&self, state: StateRef, key: u128) -> Result<(Option<Stub>, Nodes), Status> {
         let mut con = self.connect().await?;
         let req = Request::new(Key { key }.rep(Some(state.stub())));
 
@@ -369,7 +243,7 @@ impl Node {
     async fn find_value(
         &self,
         state: StateRef,
-        key: u32,
+        key: u128,
     ) -> Result<(Option<Stub>, StoreOrNodes), Status> {
         let mut con = self.connect().await?;
         let req = Request::new(Key { key }.rep(Some(state.stub())));
@@ -389,8 +263,8 @@ impl Node {
 impl State {
     pub async fn log(&self, into_msg: impl Into<String>) {
         let msg = into_msg.into();
-        if let Some(console) = &self.console {
-            if console.send(msg.clone()).await.is_err() {
+        if let Some(log) = &self.log {
+            if log.send(msg.clone()).await.is_err() {
                 eprintln!("{}", msg);
             }
         } else {
@@ -429,7 +303,7 @@ impl State {
         }
     }
 
-    async fn nearest(&self, key: u32) -> Vec<Node> {
+    async fn nearest(&self, key: u128) -> Vec<Node> {
         let mut nodes: Vec<Node>;
         {
             let buckets = self.buckets.lock().await;
@@ -445,7 +319,7 @@ impl State {
 
     async fn retire(&self, node: Node) {
         let dist = node.id ^ self.id;
-        let bid = dist.leading_zeros() as usize;
+        let bid = (dist.leading_zeros() - ID_MASK.leading_zeros()) as usize;
         {
             let mut buckets = self.buckets.lock().await;
             if let Some(i) = buckets[bid].iter().position(|n| n.id == node.id) {
@@ -460,7 +334,7 @@ impl State {
         }
         //self.log(format!("{:?}", node));
         let dist = node.id ^ self.id;
-        let bid = dist.leading_zeros() as usize;
+        let bid = (dist.leading_zeros() - ID_MASK.leading_zeros()) as usize;
         let mut test = false;
         let mut first = Node::default();
         {
@@ -476,7 +350,7 @@ impl State {
         if test {
             let mut con = first.connect().await?;
             let req = Request::new(proto::Ping {
-                source: Some(self.stub()),
+                source: Some(self.stub().rep()),
             });
 
             if con.ping(req).await.is_ok() {
@@ -508,7 +382,7 @@ impl State {
 pub type ServerResult = Result<(), tonic::transport::Error>;
 
 impl StateRef {
-    pub async fn lookup_node(&self, key: u32) -> Result<Vec<Node>, Box<dyn Error + Send>> {
+    pub async fn lookup_node(&self, key: u128) -> Result<Vec<Node>, Box<dyn Error + Send>> {
         let mut queue: Vec<Node> = self.nearest(key).await;
         queue.sort_unstable_by_key(|n| n.id ^ key);
         let mut seen: Vec<Node> = queue.clone();
@@ -519,8 +393,8 @@ impl StateRef {
         let mut futs = JoinSet::new();
         while futs.len() < ALPHA && !queue.is_empty() {
             let node = queue.remove(0);
-            let selfc = *self;
-            futs.spawn(async move { (node.clone(), node.find_node(selfc, key).await) });
+            let self_copy = *self;
+            futs.spawn(async move { (node.clone(), node.find_node(self_copy, key).await) });
         }
 
         while !futs.is_empty() {
@@ -550,8 +424,8 @@ impl StateRef {
                 if finished.len() >= K && finished[K - 1].id ^ key < node.id ^ key {
                     continue;
                 }
-                let selfc = *self;
-                futs.spawn(async move { (node.clone(), node.find_node(selfc, key).await) });
+                let self_copy = *self;
+                futs.spawn(async move { (node.clone(), node.find_node(self_copy, key).await) });
             }
         }
 
@@ -561,7 +435,7 @@ impl StateRef {
         Ok(finished)
     }
 
-    pub async fn lookup_value(&self, key: u32) -> Result<StoreOrNodes, Box<dyn Error + Send>> {
+    pub async fn lookup_value(&self, key: u128) -> Result<StoreOrNodes, Box<dyn Error + Send>> {
         if let Some(value) = self.store.lock().await.get(&key) {
             return Ok(Store {
                 key,
@@ -580,8 +454,8 @@ impl StateRef {
         let mut futs = JoinSet::new();
         while futs.len() < ALPHA && !queue.is_empty() {
             let node = queue.remove(0);
-            let selfc = *self;
-            futs.spawn(async move { (node.clone(), node.find_value(selfc, key).await) });
+            let self_copy = *self;
+            futs.spawn(async move { (node.clone(), node.find_value(self_copy, key).await) });
         }
 
         while !futs.is_empty() {
@@ -615,8 +489,8 @@ impl StateRef {
                 if finished.len() >= K && finished[K - 1].id ^ key < node.id ^ key {
                     continue;
                 }
-                let selfc = *self;
-                futs.spawn(async move { (node.clone(), node.find_value(selfc, key).await) });
+                let self_copy = *self;
+                futs.spawn(async move { (node.clone(), node.find_value(self_copy, key).await) });
             }
         }
 
@@ -628,7 +502,7 @@ impl StateRef {
 
     pub async fn lookup_and_store(
         &self,
-        key: u32,
+        key: u128,
         value: &[u8],
         publish: bool,
     ) -> Result<(), Box<dyn Error + Send>> {
@@ -642,7 +516,7 @@ impl StateRef {
         Ok(())
     }
 
-    pub async fn publish(&self, key: u32, value: &[u8]) -> Result<(), Box<dyn Error + Send>> {
+    pub async fn raw_publish(&self, key: u128, value: &[u8]) -> Result<(), Box<dyn Error + Send>> {
         self.store
             .lock()
             .await
@@ -650,17 +524,23 @@ impl StateRef {
         self.lookup_and_store(key, value, true).await
     }
 
-    async fn refresh_buckets(&self, bid: usize) -> Result<(), Box<dyn Error + Send>> {
+    pub async fn publish(&self, value: &[u8]) -> Result<u128, Box<dyn Error + Send>> {
+        let key = key_hash(value);
+        self.raw_publish(key, value).await?;
+        Ok(key)
+    }
+
+    async fn refresh_bucket(&self, bid: usize) -> Result<(), Box<dyn Error + Send>> {
         if self.buckets.lock().await[bid].is_empty() {
             return Ok(());
         }
-        let keep_mask = if bid == 0 { 0 } else { !0u32 << (32 - bid) };
-        let flip_mask = 1 << (31 - bid);
+        let keep_mask = if bid == 0 { 0 } else { !0u128 << (ID_BITS - bid) };
+        let flip_mask = 1 << (ID_BITS-1 - bid);
         let first = (self.id & keep_mask) | (!self.id & flip_mask);
-        let last = if bid == 31 {
+        let last = if bid == ID_BITS-1 {
             first
         } else {
-            first | (!0u32 >> (bid + 1))
+            first | (ID_MASK >> (bid + 1))
         };
         let key = rand::random_range(first..=last);
         self.lookup_node(key).await?;
@@ -677,7 +557,10 @@ impl Tokad for StateRef {
         // Return an instance of type HelloReply
         //self.log(format!("Ping: {:?}", request));
 
-        if let Some(Stub { id, port }) = request.get_ref().source {
+        let source = request.get_ref().source.clone();
+
+        if let Some(stub) = source {
+            let Stub{id, port} = stub.unrep();
             if let Some(loc) = request.remote_addr() {
                 self.log(format!("Ping: {} {} {}", id, loc.ip(), port))
                     .await;
@@ -695,7 +578,7 @@ impl Tokad for StateRef {
         }
 
         Ok(Response::new(proto::Pong {
-            source: Some(self.stub()),
+            source: Some(self.stub().rep()),
         })) // Send back our formatted greeting
     }
     async fn store(
@@ -705,7 +588,9 @@ impl Tokad for StateRef {
         // Return an instance of type HelloReply
         //self.log(format!("Request: {:?}", request));
 
-        if let Some(Stub { id, port }) = request.get_ref().source {
+        let (source, Store{ key, value }, publish) = request.get_ref().clone().unrep();
+
+        if let Some(Stub { id, port }) = source {
             if let Some(loc) = request.remote_addr() {
                 self.log(format!("Source: {} {} {}", id, loc.ip(), port))
                     .await;
@@ -719,9 +604,6 @@ impl Tokad for StateRef {
                 self.log(format!("Source: {} no source addr???", id)).await;
             }
         }
-
-        let publish = request.get_ref().publish;
-        let Store { key, value } = request.into_inner().unrep().1;
 
         if let Ok(string_value) = String::from_utf8(value.clone()) {
             self.log(format!("Store {}: {}", key, string_value)).await;
@@ -742,7 +624,7 @@ impl Tokad for StateRef {
         }
 
         Ok(Response::new(proto::Pong {
-            source: Some(self.stub()),
+            source: Some(self.stub().rep()),
         }))
     }
 
@@ -753,7 +635,9 @@ impl Tokad for StateRef {
         // Return an instance of type HelloReply
         //self.log(format!("Request: {:?}", request));
 
-        if let Some(Stub { id, port }) = request.get_ref().source {
+        let (source, Key{key}) = request.get_ref().clone().unrep();
+
+        if let Some(Stub { id, port }) = source {
             if let Some(loc) = request.remote_addr() {
                 self.log(format!("Source: {} {} {}", id, loc.ip(), port))
                     .await;
@@ -767,8 +651,6 @@ impl Tokad for StateRef {
                 self.log(format!("Source: {} no source addr???", id)).await;
             }
         }
-
-        let key = request.get_ref().key;
 
         self.log(format!("Find node {}", key)).await;
 
@@ -786,7 +668,9 @@ impl Tokad for StateRef {
     ) -> Result<Response<proto::StoreOrNodes>, Status> {
         //self.log(format!("Request: {:?}", request)).await;
 
-        if let Some(Stub { id, port }) = request.get_ref().source {
+        let (source, Key{key}) = request.get_ref().clone().unrep();
+
+        if let Some(Stub { id, port }) = source {
             if let Some(loc) = request.remote_addr() {
                 self.log(format!("Source: {} {} {}", id, loc.ip(), port))
                     .await;
@@ -801,11 +685,8 @@ impl Tokad for StateRef {
             }
         }
 
-        let key = request.get_ref().key;
-
         self.log(format!("Find value {}", key)).await;
 
-        let key = request.get_ref().key;
         {
             let store = self.store.lock().await;
             if store.contains_key(&key) {
@@ -832,7 +713,7 @@ impl Tokad for StateRef {
 
 pub fn start_server(
     port: u16,
-    console: Option<Sender<String>>,
+    log: Option<Sender<String>>,
     seed: Option<SocketAddr>,
 ) -> Result<
     (
@@ -845,7 +726,7 @@ pub fn start_server(
     let bind_ip = "::".parse()?;
     let bind_addr = SocketAddr::new(bind_ip, port);
     let state = Box::leak(Box::new(State::default()));
-    state.console = console;
+    state.log = log;
     state.port = port;
 
     let state_ref = state.get_ref();
@@ -883,7 +764,7 @@ pub fn start_server(
                     //     }
                     // }
                     // for i in 0..last {
-                    //     if let Err(e) = state_ref.refresh_buckets(i).await {
+                    //     if let Err(e) = state_ref.refresh_bucket(i).await {
                     //         state_ref.log(format!("init refresh error: {}", e)).await;
                     //     };
                     // }
@@ -900,7 +781,7 @@ pub fn start_server(
     }
 
     let time_loop_handle = tokio::spawn(async move {
-        let mut ticker = interval(JIFFY);
+        let mut ticker = tokio::time::interval(JIFFY);
         state_ref.log(format!("id: {}", state_ref.id)).await;
         loop {
             ticker.tick().await;
@@ -920,7 +801,7 @@ pub fn start_server(
                 }
                 for i in to_refresh {
                     tokio::spawn( async move {
-                        let _ = state_ref.refresh_buckets(i).await;
+                        let _ = state_ref.refresh_bucket(i).await;
                         state_ref.log(format!("REFRESH {}", i)).await;
                     });
                 }
@@ -937,7 +818,7 @@ pub fn start_server(
                 if replicate {
                     state_ref.log("REPLICATE").await;
                 }
-                let mut expired: Vec<u32> = vec![];
+                let mut expired: Vec<u128> = vec![];
                 let keys = state_ref
                     .store
                     .lock()
@@ -1001,12 +882,12 @@ pub fn start_server(
     Ok((state_ref, server_handle, time_loop_handle))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        ()
-    }
-}
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//
+//     #[test]
+//     fn it_works() {
+//
+//     }
+// }
