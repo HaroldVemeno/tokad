@@ -1,23 +1,20 @@
 use crate::tokad::{Data, Node, StateRef, StoreOrNodes};
-use std::{
-    io,
-    net::ToSocketAddrs,
-    sync::mpsc::Receiver,
-    time::{Duration, Instant},
-};
+use std::{io, net::ToSocketAddrs};
 
+use futures::{FutureExt, StreamExt, future::OptionFuture};
+use tokio::{select, sync::mpsc::Receiver};
+
+use crossterm::event::{Event, EventStream, KeyCode, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
-    crossterm::event::{self, Event, KeyCode, KeyModifiers},
     layout::{Constraint, Layout},
     text::{Line, Text},
     widgets::{Paragraph, Wrap},
 };
-use tokio::task::{JoinHandle, spawn_blocking};
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
-const FPS: f64 = 60.0;
+//const FPS: f64 = 60.0;
 
 #[derive(Debug, Default)]
 pub struct Console {
@@ -27,61 +24,51 @@ pub struct Console {
     log: Vec<String>,
 }
 
-pub fn start_console(
+pub async fn start_console(
     state: Option<StateRef>,
     rcv: Option<Receiver<String>>,
-) -> JoinHandle<Result<(), io::Error>> {
+) -> Result<(), io::Error> {
     let con = Console {
         server: state,
         channel: rcv,
         ..Console::default()
     };
 
-    spawn_blocking(move || {
-        let mut term = ratatui::init();
-        let res = con.run(&mut term);
-        ratatui::restore();
-        res
-    })
+    let mut term = ratatui::init();
+    let res = con.run(&mut term).await;
+    ratatui::restore();
+    res
 }
 
 impl Console {
-    pub fn push(&mut self, s: impl Into<String>) {
-        self.log.push(s.into());
-    }
-
-    fn run(mut self, term: &mut DefaultTerminal) -> io::Result<()> {
-        let tick_time = Duration::from_secs_f64(1.0 / FPS);
-        let mut last_tick = Instant::now();
-        let mut change = true;
+    async fn run(mut self, term: &mut DefaultTerminal) -> io::Result<()> {
+        let mut event_stream = EventStream::new();
         loop {
-            if self.channel.is_some() {
-                while let Some(Ok(msg)) = self.channel.as_mut().map(|o| o.try_recv()) {
-                    self.push(msg);
-                    change = true;
-                }
-            }
+            term.draw(|frame| self.render(frame))?;
 
-            if change {
-                term.draw(|frame| self.render(frame))?;
-                change = false;
-            }
+            let mut log_buf = Vec::with_capacity(64);
+            let log_fut: OptionFuture<_> = self
+                .channel
+                .as_mut()
+                .map(|ch| ch.recv_many(&mut log_buf, 64))
+                .into();
 
-            let timeout = tick_time.saturating_sub(last_tick.elapsed());
-            if event::poll(timeout)? {
-                let event = event::read()?;
-                change = true;
-                if let Event::Key(key) = event {
-                    if key.code == KeyCode::Enter && self.enter() {
-                        return Ok(());
-                    }
-                    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
-                        return Ok(());
-                    }
-                    self.input.handle_event(&event);
+            select! {
+                _ = log_fut => {
+                    self.log.append(&mut log_buf);
                 }
-            } else {
-                last_tick = Instant::now();
+                Some(Ok(event)) = event_stream.next().fuse() => {
+                    if let Event::Key(key) = event {
+                        if key.code == KeyCode::Enter && self.enter() {
+                            return Ok(());
+                        }
+                        if key.modifiers == KeyModifiers::CONTROL
+                            && key.code == KeyCode::Char('c') {
+                            return Ok(());
+                        }
+                        self.input.handle_event(&event);
+                    }
+                }
             }
         }
     }
@@ -111,7 +98,7 @@ impl Console {
 
     fn enter(&mut self) -> bool {
         let cmd = self.input.value_and_reset();
-        self.push(format!("> {}", cmd));
+        self.log.push(format!("> {}", cmd));
         let words: Vec<&str> = cmd.split_whitespace().collect();
         if words.is_empty() {
             return false;
@@ -125,134 +112,142 @@ impl Console {
             }
             "ping" => {
                 if words.len() != 2 {
-                    self.push("Wrong argument count");
+                    self.log.push("Wrong argument count".to_string());
                     return false;
                 }
                 let Ok(mut socks) = words[1]
                     .to_socket_addrs()
                     .or_else(|_| (words[1], 50051).to_socket_addrs())
                 else {
-                    self.push("Unparseable location");
+                    self.log.push("Unparseable location".to_string());
                     return false;
                 };
                 let Some(sock) = socks.next() else {
-                    self.push("Not resolvable");
+                    self.log.push("Not resolvable".to_string());
                     return false;
                 };
-                self.push(format!("{}", sock));
+                self.log.push(format!("{}", sock));
                 let node = Node::from_sock(0, sock);
                 if let Some(server) = self.server {
                     tokio::spawn(async move {
-                        server.log(format!("{:?}", (node.ping(server).await)));
+                        server.log(format!("{:?}", (node.ping(server).await))).await;
                     });
                 } else {
-                    self.push("Server is not available");
+                    self.log.push("Server is not available".to_string());
                 }
             }
 
             "lookup_node" => {
                 if words.len() != 2 {
-                    self.push("Wrong argument count");
+                    self.log.push("Wrong argument count".to_string());
                     return false;
                 }
 
                 let Ok(key) = words[1].parse::<u32>() else {
-                    self.push("Unparseable key");
+                    self.log.push("Unparseable key".to_string());
                     return false;
                 };
                 if let Some(server) = self.server {
                     tokio::spawn(async move {
-                        server.log(format!(
-                            "Lookup result: {:?}",
-                            (server.lookup_node(key).await)
-                        ));
+                        server
+                            .log(format!(
+                                "Lookup result: {:?}",
+                                (server.lookup_node(key).await)
+                            ))
+                            .await;
                     });
                 } else {
-                    self.push("Server is not available");
+                    self.log.push("Server is not available".to_string());
                 }
             }
 
             "lookup" => {
                 if words.len() != 2 {
-                    self.push("Wrong argument count");
+                    self.log.push("Wrong argument count".to_string());
                     return false;
                 }
 
                 let Ok(key) = words[1].parse::<u32>() else {
-                    self.push("Unparseable key");
+                    self.log.push("Unparseable key".to_string());
                     return false;
                 };
                 if let Some(server) = self.server {
                     tokio::spawn(async move {
                         match server.lookup_value(key).await {
                             Ok(StoreOrNodes::Store(store)) => {
-                                server.log(format!("{}", store));
+                                server.log(format!("{}", store)).await;
                             }
                             Ok(StoreOrNodes::Nodes(nodes)) => {
-                                server.log(
-                                    nodes
-                                        .nodes
-                                        .iter()
-                                        .map(|n| n.to_string())
-                                        .collect::<Vec<_>>()
-                                        .join(" ")
-                                        .to_string(),
-                                );
+                                server
+                                    .log(
+                                        nodes
+                                            .nodes
+                                            .iter()
+                                            .map(|n| n.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(" ")
+                                            .to_string(),
+                                    )
+                                    .await;
                             }
-                            Err(e) => server.log(format!("{}", e)),
+                            Err(e) => {
+                                server.log(e.to_string()).await;
+                            }
                         }
                     });
                 } else {
-                    self.push("Server is not available");
+                    self.log.push("Server is not available".to_string());
                 }
             }
             "local_store" => {
                 if words.len() != 3 {
-                    self.push("Wrong argument count");
+                    self.log.push("Wrong argument count".to_string());
                     return false;
                 }
 
                 let Ok(key) = words[1].parse() else {
-                    self.push("Key not parsable");
+                    self.log.push("Key not parsable".to_string());
                     return false;
                 };
                 let value = words[2].bytes().collect();
                 if let Some(server) = self.server {
                     tokio::spawn(async move {
                         server.store.lock().await.insert(key, Data::new(value));
-                        server.log("Stored".to_string());
+                        server.log("Stored".to_string()).await;
                     });
                 }
             }
             "store" => {
                 if words.len() != 3 {
-                    self.push("Wrong argument count");
+                    self.log.push("Wrong argument count".to_string());
                     return false;
                 }
 
                 let Ok(key) = words[1].parse() else {
-                    self.push("Key not parsable");
+                    self.log.push("Key not parsable".to_string());
                     return false;
                 };
                 let value: Vec<u8> = words[2].bytes().collect();
                 if let Some(server) = self.server {
                     tokio::spawn(async move {
-                        server.log(format!("{:?}", server.publish(key, &value).await));
+                        server
+                            .log(format!("{:?}", server.publish(key, &value).await))
+                            .await;
                     });
                 }
             }
             "print" => {
                 if words.len() != 2 {
-                    self.push("Wrong argument count");
+                    self.log.push("Wrong argument count".to_string());
                     return false;
                 }
                 if let Some(server) = self.server {
                     match words[1] {
                         "id" => {
-                            self.push(format!("id: {}", server.id));
+                            self.log.push(format!("id: {}", server.id));
                         }
                         "port" => {
-                            self.push(format!("port: {}", server.port));
+                            self.log.push(format!("port: {}", server.port));
                         }
                         "buckets" => {
                             tokio::spawn(async move { server.log_buckets().await });
@@ -261,15 +256,15 @@ impl Console {
                             tokio::spawn(async move { server.log_store().await });
                         }
                         _ => {
-                            self.push("Unknown thing to print");
+                            self.log.push("Unknown thing to print".to_string());
                         }
                     }
                 } else {
-                    self.push("Server is not available");
+                    self.log.push("Server is not available".to_string());
                 }
             }
             _ => {
-                self.push("Unknown command");
+                self.log.push("Unknown command".to_string());
             }
         }
 

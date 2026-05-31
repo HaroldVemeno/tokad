@@ -1,11 +1,13 @@
 use std::error::Error;
 use std::net::ToSocketAddrs;
-use std::sync::mpsc::channel;
+use tokio::sync::mpsc::channel;
 
 use clap::Parser;
 
 mod tokad;
 mod tui;
+
+const LOG_CHANNEL_BUF: usize = 512;
 
 use crate::tokad::start_server;
 use crate::tui::start_console;
@@ -23,8 +25,9 @@ struct Args {
     daemon: bool,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // console_subscriber::init();
     let args = Args::parse();
 
     let seed = match args.seed {
@@ -45,10 +48,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let (_state, server_handle, _loop_handle) = start_server(args.port, None, seed)?;
         server_handle.await??;
     } else {
-        let (con_snd, con_rcv) = channel();
+        let (con_snd, con_rcv) = channel(LOG_CHANNEL_BUF);
         let (state, _server_handle, _loop_handle) = start_server(args.port, Some(con_snd), seed)?;
         let console_handle = start_console(Some(state), Some(con_rcv));
-        console_handle.await??;
+        console_handle.await?;
     }
 
     Ok(())
