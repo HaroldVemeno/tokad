@@ -1,6 +1,25 @@
 use crate::hash::ID_MASK;
 use crate::tokad::proto;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataError {
+    InvalidIp(String),
+    InvalidPort(String),
+    InvalidIdLength(usize),
+}
+
+impl std::fmt::Display for DataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataError::InvalidIp(e) => write!(f, "Invalid IP address: {}", e),
+            DataError::InvalidPort(e) => write!(f, "Invalid port: {}", e),
+            DataError::InvalidIdLength(len) => write!(f, "Invalid ID length: expected 16 bytes, got {} bytes", len),
+        }
+    }
+}
+
+impl std::error::Error for DataError {}
+
 #[derive(Debug, Clone, Default)]
 pub struct Stub {
     pub id: u128,
@@ -36,27 +55,32 @@ pub enum StoreOrNodes {
     Nodes(Nodes),
 }
 
-fn parse_id(bytes: &[u8]) -> u128 {
+fn parse_id(bytes: &[u8]) -> Result<u128, DataError> {
+    if bytes.len() != 16 {
+        return Err(DataError::InvalidIdLength(bytes.len()));
+    }
     let mut buf = [0u8; 16];
     buf.copy_from_slice(bytes);
-    u128::from_le_bytes(buf) & ID_MASK
+    Ok(u128::from_le_bytes(buf) & ID_MASK)
 }
 
 impl Stub {
     pub fn rep(self) -> proto::Stub {
         proto::Stub {
             id: self.id.to_le_bytes().to_vec(),
-            port: self.port
+            port: self.port,
         }
     }
 }
 
 impl proto::Stub {
-    pub fn unrep(self) -> Stub {
-        Stub {
-            id: parse_id(&self.id),
-            port: self.port
-        }
+    pub fn unrep(self) -> Result<Stub, DataError> {
+        let id = parse_id(&self.id)?;
+        u16::try_from(self.port).map_err(|e| DataError::InvalidPort(e.to_string()))?;
+        Ok(Stub {
+            id,
+            port: self.port,
+        })
     }
 }
 
@@ -65,18 +89,21 @@ impl Node {
         proto::Node {
             id: self.id.to_le_bytes().to_vec(),
             ip: self.ip,
-            port: self.port
+            port: self.port,
         }
     }
 }
 
 impl proto::Node {
-    pub fn unrep(self) -> Node {
-        Node {
-            id: parse_id(&self.id),
+    pub fn unrep(self) -> Result<Node, DataError> {
+        let id = parse_id(&self.id)?;
+        self.ip.parse::<std::net::IpAddr>().map_err(|e| DataError::InvalidIp(e.to_string()))?;
+        u16::try_from(self.port).map_err(|e| DataError::InvalidPort(e.to_string()))?;
+        Ok(Node {
+            id,
             ip: self.ip,
-            port: self.port
-        }
+            port: self.port,
+        })
     }
 }
 
@@ -93,10 +120,16 @@ impl Nodes {
 }
 
 impl proto::Nodes {
-    pub fn unrep(self) -> (Option<Stub>, Nodes) {
-        (self.source.map(|s| s.unrep()), Nodes {
-            nodes: self.nodes.into_iter().map(|n| n.unrep()).collect(),
-        })
+    pub fn unrep(self) -> Result<(Option<Stub>, Nodes), DataError> {
+        let stub = match self.source {
+            Some(s) => Some(s.unrep()?),
+            None => None,
+        };
+        let mut nodes = Vec::with_capacity(self.nodes.len());
+        for n in self.nodes {
+            nodes.push(n.unrep()?);
+        }
+        Ok((stub, Nodes { nodes }))
     }
 }
 
@@ -122,27 +155,37 @@ impl proto::Store {
             publish,
         }
     }
-    pub fn unrep(self) -> (Option<Stub>, Store) {
-        (
-            self.source.map(|s| s.unrep()),
+    pub fn unrep(self) -> Result<(Option<Stub>, Store), DataError> {
+        let stub = match self.source {
+            Some(s) => Some(s.unrep()?),
+            None => None,
+        };
+        let key = parse_id(&self.key)?;
+        Ok((
+            stub,
             Store {
-                key: parse_id(&self.key),
+                key,
                 value: self.value,
             },
-        )
+        ))
     }
 }
 
 impl proto::StoreRequest {
-    pub fn unrep(self) -> (Option<Stub>, Store, bool) {
-        (
-            self.source.map(|s| s.unrep()),
+    pub fn unrep(self) -> Result<(Option<Stub>, Store, bool), DataError> {
+        let stub = match self.source {
+            Some(s) => Some(s.unrep()?),
+            None => None,
+        };
+        let key = parse_id(&self.key)?;
+        Ok((
+            stub,
             Store {
-                key: parse_id(&self.key),
+                key,
                 value: self.value,
             },
             self.publish,
-        )
+        ))
     }
 }
 
@@ -156,13 +199,18 @@ impl Key {
 }
 
 impl proto::Key {
-    pub fn unrep(self) -> (Option<Stub>, Key) {
-        (
-            self.source.map(|s| s.unrep()),
+    pub fn unrep(self) -> Result<(Option<Stub>, Key), DataError> {
+        let stub = match self.source {
+            Some(s) => Some(s.unrep()?),
+            None => None,
+        };
+        let key = parse_id(&self.key)?;
+        Ok((
+            stub,
             Key {
-                key: parse_id(&self.key),
-            }
-        )
+                key,
+            },
+        ))
     }
 }
 
@@ -180,16 +228,31 @@ impl StoreOrNodes {
 }
 
 impl proto::StoreOrNodes {
-    pub fn unrep(self) -> Option<(Option<Stub>, StoreOrNodes)> {
-        Some(match self.oneof? {
+    pub fn unrep(self) -> Result<Option<(Option<Stub>, StoreOrNodes)>, DataError> {
+        let oneof = match self.oneof {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+        Ok(Some(match oneof {
             proto::store_or_nodes::Oneof::Store(store) => {
-                let (stub, store) = store.unrep();
+                let (stub, store) = store.unrep()?;
                 (stub, store.or_nodes())
             }
             proto::store_or_nodes::Oneof::Nodes(nodes) => {
-                let (stub, nodes) = nodes.unrep();
+                let (stub, nodes) = nodes.unrep()?;
                 (stub, nodes.or_store())
             }
-        })
+        }))
+    }
+}
+
+impl std::fmt::Display for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        if let Ok(s) = std::str::from_utf8(&self.value) {
+            write!(f, "{}: {}", self.key, s)?;
+        } else {
+            write!(f, "{}: {:?}", self.key, self.value)?;
+        }
+        Ok(())
     }
 }

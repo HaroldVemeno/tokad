@@ -66,16 +66,6 @@ impl Data {
     }
 }
 
-impl Display for Store {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        if let Ok(s) = str::from_utf8(&self.value) {
-            write!(f, "{}: {}", self.key, s)?;
-        } else {
-            write!(f, "{}: {:?}", self.key, self.value)?;
-        }
-        Ok(())
-    }
-}
 
 use crate::hash::{ID_BITS, ID_MASK, key_hash};
 pub use crate::data::{Stub, Node, Key, Store, Nodes, StoreOrNodes};
@@ -154,8 +144,10 @@ impl Display for Node {
 }
 
 impl Node {
-    pub fn sock(&self) -> SocketAddr {
-        SocketAddr::new(self.ip.parse().unwrap(), self.port.try_into().unwrap())
+    pub fn sock(&self) -> Option<SocketAddr> {
+        let ip = self.ip.parse().ok()?;
+        let port = self.port.try_into().ok()?;
+        Some(SocketAddr::new(ip, port))
     }
 
     pub fn from_sock(id: u128, sock: SocketAddr) -> Self {
@@ -173,11 +165,14 @@ impl Node {
         }
     }
     async fn connect(&self) -> Result<TokadClient<Channel>, Status> {
+        let sock = self.sock().ok_or_else(|| {
+            Status::invalid_argument("Invalid or unparseable IP/port in node metadata")
+        })?;
         TokadClient::connect(
             Endpoint::from(
                 Uri::builder()
                     .scheme("http")
-                    .authority(self.sock().to_string())
+                    .authority(sock.to_string())
                     .path_and_query("/")
                     .build()
                     .unwrap(),
@@ -195,7 +190,12 @@ impl Node {
             source: Some(state.stub().rep()),
         });
 
-        let res = con.ping(req).await.map(|p| p.into_inner().source.map(|s| s.unrep()));
+        let res = con.ping(req).await.and_then(|p| {
+            match p.into_inner().source {
+                Some(s) => s.unrep().map(Some).map_err(|e| Status::invalid_argument(e.to_string())),
+                None => Ok(None),
+            }
+        });
         if res.is_ok() {
             tokio::spawn(state.state.refresh(self.clone()));
         }
@@ -219,7 +219,12 @@ impl Node {
             .req(publish),
         );
 
-        let res = con.store(req).await.map(|p| p.into_inner().source.map(|s| s.unrep()));
+        let res = con.store(req).await.and_then(|p| {
+            match p.into_inner().source {
+                Some(s) => s.unrep().map(Some).map_err(|e| Status::invalid_argument(e.to_string())),
+                None => Ok(None),
+            }
+        });
         if res.is_ok() {
             tokio::spawn(state.state.refresh(self.clone()));
         }
@@ -230,10 +235,9 @@ impl Node {
         let mut con = self.connect().await?;
         let req = Request::new(Key { key }.rep(Some(state.stub())));
 
-        let res = con
-            .find_node(req)
-            .await
-            .map(|resp| resp.into_inner().unrep());
+        let res = con.find_node(req).await.and_then(|resp| {
+            resp.into_inner().unrep().map_err(|e| Status::invalid_argument(e.to_string()))
+        });
         if res.is_ok() {
             tokio::spawn(state.state.refresh(self.clone()));
         }
@@ -251,6 +255,7 @@ impl Node {
         let res = con.find_value(req).await.and_then(|resp| {
             resp.into_inner()
                 .unrep()
+                .map_err(|e| Status::invalid_argument(e.to_string()))?
                 .ok_or(Status::invalid_argument("No reply content"))
         });
         if res.is_ok() {
@@ -318,8 +323,14 @@ impl State {
     }
 
     async fn retire(&self, node: Node) {
+        if node.id == self.id || node.id == 0 {
+            return;
+        }
         let dist = node.id ^ self.id;
         let bid = (dist.leading_zeros() - ID_MASK.leading_zeros()) as usize;
+        if bid >= ID_BITS {
+            return;
+        }
         {
             let mut buckets = self.buckets.lock().await;
             if let Some(i) = buckets[bid].iter().position(|n| n.id == node.id) {
@@ -422,7 +433,7 @@ impl StateRef {
             while futs.len() < ALPHA && !queue.is_empty() {
                 let node = queue.remove(0);
                 if finished.len() >= K && finished[K - 1].id ^ key < node.id ^ key {
-                    continue;
+                    break;
                 }
                 let self_copy = *self;
                 futs.spawn(async move { (node.clone(), node.find_node(self_copy, key).await) });
@@ -487,7 +498,7 @@ impl StateRef {
             while futs.len() < ALPHA && !queue.is_empty() {
                 let node = queue.remove(0);
                 if finished.len() >= K && finished[K - 1].id ^ key < node.id ^ key {
-                    continue;
+                    break;
                 }
                 let self_copy = *self;
                 futs.spawn(async move { (node.clone(), node.find_value(self_copy, key).await) });
@@ -508,6 +519,9 @@ impl StateRef {
     ) -> Result<(), Box<dyn Error + Send>> {
         let close = self.lookup_node(key).await?;
         for node in close {
+            if node.id == self.id {
+                continue;
+            }
             node.store(*self, key, value, publish)
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn Error + Send>)?;
@@ -560,7 +574,7 @@ impl Tokad for StateRef {
         let source = request.get_ref().source.clone();
 
         if let Some(stub) = source {
-            let Stub{id, port} = stub.unrep();
+            let Stub{id, port} = stub.unrep().map_err(|e| Status::invalid_argument(e.to_string()))?;
             if let Some(loc) = request.remote_addr() {
                 self.log(format!("Ping: {} {} {}", id, loc.ip(), port))
                     .await;
@@ -588,7 +602,7 @@ impl Tokad for StateRef {
         // Return an instance of type HelloReply
         //self.log(format!("Request: {:?}", request));
 
-        let (source, Store{ key, value }, publish) = request.get_ref().clone().unrep();
+        let (source, Store{ key, value }, _publish) = request.get_ref().clone().unrep().map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         if let Some(Stub { id, port }) = source {
             if let Some(loc) = request.remote_addr() {
@@ -615,9 +629,7 @@ impl Tokad for StateRef {
             let mut store = self.store.lock().await;
             if let Some(val) = store.get_mut(&key) {
                 // TODO: old value check
-                if publish {
-                    val.refresh();
-                }
+                val.refresh();
             } else {
                 store.insert(key, Data::new(value));
             }
@@ -635,7 +647,7 @@ impl Tokad for StateRef {
         // Return an instance of type HelloReply
         //self.log(format!("Request: {:?}", request));
 
-        let (source, Key{key}) = request.get_ref().clone().unrep();
+        let (source, Key{key}) = request.get_ref().clone().unrep().map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         if let Some(Stub { id, port }) = source {
             if let Some(loc) = request.remote_addr() {
@@ -668,7 +680,7 @@ impl Tokad for StateRef {
     ) -> Result<Response<proto::StoreOrNodes>, Status> {
         //self.log(format!("Request: {:?}", request)).await;
 
-        let (source, Key{key}) = request.get_ref().clone().unrep();
+        let (source, Key{key}) = request.get_ref().clone().unrep().map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         if let Some(Stub { id, port }) = source {
             if let Some(loc) = request.remote_addr() {
