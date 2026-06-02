@@ -7,27 +7,28 @@ message Stub {
 }
 
 message Ping {
-  optional Stub source = 1;
+  Stub source = 1;
 }
 message Pong {
-  optional Stub source = 1;
+  Stub source = 1;
 }
 
 message Store {
-  optional Stub source = 1;
+  Stub source = 1;
   bytes key = 2;
   bytes value = 3;
 }
 
 message StoreRequest {
-  optional Stub source = 1;
+  Stub source = 1;
   bytes key = 2;
   bytes value = 3;
   bool publish = 4;
+  uint64 publish_time = 5;
 }
 
 message Key {
-  optional Stub source = 1;
+  Stub source = 1;
   bytes key = 2;
 }
 
@@ -38,7 +39,7 @@ message Node {
 }
 
 message Nodes {
-  optional Stub source = 1;
+  Stub source = 1;
   repeated Node nodes = 2;
 }
 

@@ -1,5 +1,5 @@
 use crate::tokad::{Data, Node, StateRef, StoreOrNodes};
-use std::{io, net::ToSocketAddrs};
+use std::{io, net::ToSocketAddrs, time::SystemTime};
 
 use futures::{FutureExt, StreamExt, future::OptionFuture};
 use tokio::{select, sync::mpsc};
@@ -112,7 +112,7 @@ impl Tui {
                 self.log.clear();
             }
             "ping" => {
-                let usage = |log : &mut Vec<String>| {
+                let usage = |log: &mut Vec<String>| {
                     log.push("Usage: ping <location>".to_string());
                 };
                 if words.len() != 2 {
@@ -145,7 +145,7 @@ impl Tui {
             }
 
             "lookup_node" => {
-                let usage = |log : &mut Vec<String>| {
+                let usage = |log: &mut Vec<String>| {
                     log.push("Usage: lookup_node <id>".to_string());
                 };
                 if words.len() != 2 {
@@ -174,7 +174,7 @@ impl Tui {
             }
 
             "lookup" => {
-                let usage = |log : &mut Vec<String>| {
+                let usage = |log: &mut Vec<String>| {
                     log.push("Usage: lookup <key>".to_string());
                 };
                 if words.len() != 2 {
@@ -217,7 +217,7 @@ impl Tui {
                 }
             }
             "local_store" => {
-                let usage = |log : &mut Vec<String>| {
+                let usage = |log: &mut Vec<String>| {
                     log.push("Usage: local_store <key> <value>".to_string());
                 };
                 if words.len() != 3 {
@@ -234,13 +234,13 @@ impl Tui {
                 let value = words[2].bytes().collect();
                 if let Some(server) = self.server {
                     tokio::spawn(async move {
-                        server.store.lock().await.insert(key, Data::new(value));
+                        server.store.lock().await.insert(key, Data::new(value, SystemTime::now()));
                         server.log("Stored".to_string()).await;
                     });
                 }
             }
             "raw_store" => {
-                let usage = |log : &mut Vec<String>| {
+                let usage = |log: &mut Vec<String>| {
                     log.push("Usage: raw_store <key> <value>".to_string());
                 };
                 if words.len() != 3 {
@@ -264,7 +264,7 @@ impl Tui {
                 }
             }
             "store" => {
-                let usage = |log : &mut Vec<String>| {
+                let usage = |log: &mut Vec<String>| {
                     log.push("Usage: raw_store <value>".to_string());
                 };
                 if words.len() != 2 {
@@ -283,8 +283,8 @@ impl Tui {
                 }
             }
             "print" => {
-                let usage = |log : &mut Vec<String>| {
-                    log.push("Usage: print id|port|buckets|store".to_string());
+                let usage = |log: &mut Vec<String>| {
+                    log.push("Usage: print id|port|buckets|store|start_time".to_string());
                 };
                 if words.len() != 2 {
                     self.log.push("Wrong argument count".to_string());
@@ -304,6 +304,9 @@ impl Tui {
                         }
                         "store" => {
                             tokio::spawn(async move { server.log_store().await });
+                        }
+                        "start_time" => {
+                            self.log.push(format!("port: {:?}", server.start_time));
                         }
                         _ => {
                             self.log.push("Unknown thing to print".to_string());

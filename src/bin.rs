@@ -4,10 +4,11 @@ use tokio::sync::mpsc::channel;
 
 use clap::Parser;
 
+mod data;
+mod error;
+mod hash;
 mod tokad;
 mod tui;
-mod data;
-mod hash;
 
 const LOG_CHANNEL_BUF: usize = 512;
 

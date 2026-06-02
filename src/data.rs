@@ -1,4 +1,6 @@
-use crate::hash::ID_MASK;
+use std::time::{self, Duration, SystemTime};
+
+use crate::hash::{ID_MASK, key_hash};
 use crate::tokad::proto;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6,6 +8,9 @@ pub enum DataError {
     InvalidIp(String),
     InvalidPort(String),
     InvalidIdLength(usize),
+    MissingField(String),
+    HashMismatch { expected: u128, actual: u128 },
+    TimeTravel { now: SystemTime, received: SystemTime },
 }
 
 impl std::fmt::Display for DataError {
@@ -13,7 +18,16 @@ impl std::fmt::Display for DataError {
         match self {
             DataError::InvalidIp(e) => write!(f, "Invalid IP address: {}", e),
             DataError::InvalidPort(e) => write!(f, "Invalid port: {}", e),
-            DataError::InvalidIdLength(len) => write!(f, "Invalid ID length: expected 16 bytes, got {} bytes", len),
+            DataError::InvalidIdLength(len) => {
+                write!(f, "Invalid ID length: expected 16 bytes, got {} bytes", len)
+            }
+            DataError::HashMismatch { expected, actual } => write!(
+                f,
+                "HashMismatch: expected {}, got {} bytes",
+                expected, actual
+            ),
+            DataError::MissingField(msg) => write!(f, "Missing field: {}", msg),
+            DataError::TimeTravel { now, received } => write!(f, "Future timestamp: now {:?}, received {:?}", now, received),
         }
     }
 }
@@ -45,6 +59,13 @@ pub struct Store {
 }
 
 #[derive(Debug, Clone)]
+pub struct StoreRequest {
+    pub store: Store,
+    pub publish: bool,
+    pub publish_time: SystemTime,
+}
+
+#[derive(Debug, Clone)]
 pub struct Nodes {
     pub nodes: Vec<Node>,
 }
@@ -65,7 +86,7 @@ fn parse_id(bytes: &[u8]) -> Result<u128, DataError> {
 }
 
 impl Stub {
-    pub fn rep(self) -> proto::Stub {
+    pub fn rep(&self) -> proto::Stub {
         proto::Stub {
             id: self.id.to_le_bytes().to_vec(),
             port: self.port,
@@ -74,7 +95,7 @@ impl Stub {
 }
 
 impl proto::Stub {
-    pub fn unrep(self) -> Result<Stub, DataError> {
+    pub fn unrep(&self) -> Result<Stub, DataError> {
         let id = parse_id(&self.id)?;
         u16::try_from(self.port).map_err(|e| DataError::InvalidPort(e.to_string()))?;
         Ok(Stub {
@@ -97,7 +118,9 @@ impl Node {
 impl proto::Node {
     pub fn unrep(self) -> Result<Node, DataError> {
         let id = parse_id(&self.id)?;
-        self.ip.parse::<std::net::IpAddr>().map_err(|e| DataError::InvalidIp(e.to_string()))?;
+        self.ip
+            .parse::<std::net::IpAddr>()
+            .map_err(|e| DataError::InvalidIp(e.to_string()))?;
         u16::try_from(self.port).map_err(|e| DataError::InvalidPort(e.to_string()))?;
         Ok(Node {
             id,
@@ -111,25 +134,21 @@ impl Nodes {
     pub fn or_store(self) -> StoreOrNodes {
         StoreOrNodes::Nodes(self)
     }
-    pub fn rep(self, stub: Option<Stub>) -> proto::Nodes {
+    pub fn rep(self, stub: Stub) -> proto::Nodes {
         proto::Nodes {
-            source: stub.map(|s| s.rep()),
+            source: Some(stub.rep()),
             nodes: self.nodes.into_iter().map(|n| n.rep()).collect(),
         }
     }
 }
 
 impl proto::Nodes {
-    pub fn unrep(self) -> Result<(Option<Stub>, Nodes), DataError> {
-        let stub = match self.source {
-            Some(s) => Some(s.unrep()?),
-            None => None,
-        };
+    pub fn unrep(self) -> Result<Nodes, DataError> {
         let mut nodes = Vec::with_capacity(self.nodes.len());
         for n in self.nodes {
             nodes.push(n.unrep()?);
         }
-        Ok((stub, Nodes { nodes }))
+        Ok(Nodes { nodes })
     }
 }
 
@@ -137,9 +156,9 @@ impl Store {
     pub fn or_nodes(self) -> StoreOrNodes {
         StoreOrNodes::Store(self)
     }
-    pub fn rep(self, stub: Option<Stub>) -> proto::Store {
+    pub fn rep(self, stub: Stub) -> proto::Store {
         proto::Store {
-            source: stub.map(|s| s.rep()),
+            source: Some(stub.rep()),
             key: self.key.to_le_bytes().to_vec(),
             value: self.value,
         }
@@ -147,75 +166,81 @@ impl Store {
 }
 
 impl proto::Store {
-    pub fn req(self, publish: bool) -> proto::StoreRequest {
-        proto::StoreRequest {
-            source: self.source,
-            key: self.key,
-            value: self.value,
-            publish,
-        }
-    }
-    pub fn unrep(self) -> Result<(Option<Stub>, Store), DataError> {
-        let stub = match self.source {
-            Some(s) => Some(s.unrep()?),
-            None => None,
-        };
+    pub fn unrep(self) -> Result<Store, DataError> {
         let key = parse_id(&self.key)?;
-        Ok((
-            stub,
-            Store {
-                key,
-                value: self.value,
-            },
-        ))
+        let expected = key_hash(&self.value);
+        if key != expected {
+            return Err(DataError::HashMismatch {
+                expected,
+                actual: key,
+            });
+        }
+        Ok(Store {
+            key,
+            value: self.value,
+        })
+    }
+}
+
+impl StoreRequest {
+    pub fn rep(self, stub: Stub) -> proto::StoreRequest {
+        proto::StoreRequest {
+            source: Some(stub.rep()),
+            key: self.store.key.to_le_bytes().to_vec(),
+            value: self.store.value,
+            publish_time: self.publish_time.duration_since(time::UNIX_EPOCH)
+                                           .unwrap_or(Duration::ZERO)
+                                           .as_millis() as u64,
+            publish: self.publish,
+        }
     }
 }
 
 impl proto::StoreRequest {
-    pub fn unrep(self) -> Result<(Option<Stub>, Store, bool), DataError> {
-        let stub = match self.source {
-            Some(s) => Some(s.unrep()?),
-            None => None,
-        };
+    pub fn unrep(self) -> Result<StoreRequest, DataError> {
         let key = parse_id(&self.key)?;
-        Ok((
-            stub,
-            Store {
+        let expected = key_hash(&self.value);
+        if key != expected {
+            return Err(DataError::HashMismatch {
+                expected,
+                actual: key,
+            });
+        }
+        let publish_time = time::UNIX_EPOCH + Duration::from_millis(self.publish_time);
+        let now = SystemTime::now();
+        if publish_time > now {
+            return Err(DataError::TimeTravel{received: publish_time, now})
+        }
+        Ok(StoreRequest {
+            store: Store {
                 key,
                 value: self.value,
             },
-            self.publish,
-        ))
+            publish: self.publish,
+            publish_time,
+        })
     }
 }
 
 impl Key {
-    pub fn rep(self, stub: Option<Stub>) -> proto::Key {
+    pub fn rep(self, stub: Stub) -> proto::Key {
         proto::Key {
-            source: stub.map(|s| s.rep()),
+            source: Some(stub.rep()),
             key: self.key.to_le_bytes().to_vec(),
         }
     }
 }
 
 impl proto::Key {
-    pub fn unrep(self) -> Result<(Option<Stub>, Key), DataError> {
-        let stub = match self.source {
-            Some(s) => Some(s.unrep()?),
-            None => None,
-        };
-        let key = parse_id(&self.key)?;
-        Ok((
-            stub,
-            Key {
-                key,
-            },
-        ))
+    pub fn unrep(self) -> Result<Key, DataError> {
+        Ok(Key {
+            key: parse_id(&self.key)?,
+        })
     }
 }
 
 impl StoreOrNodes {
-    pub fn rep(self, stub: Option<Stub>) -> proto::StoreOrNodes {
+    pub fn rep(self, stub: Stub) -> proto::StoreOrNodes {
         match self {
             StoreOrNodes::Store(store) => proto::StoreOrNodes {
                 oneof: Some(proto::store_or_nodes::Oneof::Store(store.rep(stub))),
@@ -228,21 +253,21 @@ impl StoreOrNodes {
 }
 
 impl proto::StoreOrNodes {
-    pub fn unrep(self) -> Result<Option<(Option<Stub>, StoreOrNodes)>, DataError> {
+    pub fn unrep(self) -> Result<StoreOrNodes, DataError> {
         let oneof = match self.oneof {
             Some(o) => o,
-            None => return Ok(None),
+            None => return Err(DataError::MissingField("missing store or node".to_owned())),
         };
-        Ok(Some(match oneof {
+        Ok(match oneof {
             proto::store_or_nodes::Oneof::Store(store) => {
-                let (stub, store) = store.unrep()?;
-                (stub, store.or_nodes())
+                let store = store.unrep()?;
+                store.or_nodes()
             }
             proto::store_or_nodes::Oneof::Nodes(nodes) => {
-                let (stub, nodes) = nodes.unrep()?;
-                (stub, nodes.or_store())
+                let nodes = nodes.unrep()?;
+                nodes.or_store()
             }
-        }))
+        })
     }
 }
 
@@ -254,5 +279,77 @@ impl std::fmt::Display for Store {
             write!(f, "{}: {:?}", self.key, self.value)?;
         }
         Ok(())
+    }
+}
+
+impl TryFrom<&proto::Ping> for Stub {
+    type Error = DataError;
+
+    fn try_from(req: &proto::Ping) -> Result<Self, Self::Error> {
+        match &req.source {
+            Some(s) => s.unrep(),
+            None => Err(DataError::MissingField("missing source".to_owned())),
+        }
+    }
+}
+impl TryFrom<&proto::Pong> for Stub {
+    type Error = DataError;
+
+    fn try_from(req: &proto::Pong) -> Result<Self, Self::Error> {
+        match &req.source {
+            Some(s) => s.unrep(),
+            None => Err(DataError::MissingField("missing source".to_owned())),
+        }
+    }
+}
+impl TryFrom<&proto::Store> for Stub {
+    type Error = DataError;
+
+    fn try_from(req: &proto::Store) -> Result<Self, Self::Error> {
+        match &req.source {
+            Some(s) => s.unrep(),
+            None => Err(DataError::MissingField("missing source".to_owned())),
+        }
+    }
+}
+impl TryFrom<&proto::Nodes> for Stub {
+    type Error = DataError;
+
+    fn try_from(req: &proto::Nodes) -> Result<Self, Self::Error> {
+        match &req.source {
+            Some(s) => s.unrep(),
+            None => Err(DataError::MissingField("missing source".to_owned())),
+        }
+    }
+}
+impl TryFrom<&proto::StoreRequest> for Stub {
+    type Error = DataError;
+
+    fn try_from(req: &proto::StoreRequest) -> Result<Self, Self::Error> {
+        match &req.source {
+            Some(s) => s.unrep(),
+            None => Err(DataError::MissingField("missing source".to_owned())),
+        }
+    }
+}
+impl TryFrom<&proto::Key> for Stub {
+    type Error = DataError;
+
+    fn try_from(req: &proto::Key) -> Result<Self, Self::Error> {
+        match &req.source {
+            Some(s) => s.unrep(),
+            None => Err(DataError::MissingField("missing source".to_owned())),
+        }
+    }
+}
+impl TryFrom<&proto::StoreOrNodes> for Stub {
+    type Error = DataError;
+
+    fn try_from(req: &proto::StoreOrNodes) -> Result<Self, Self::Error> {
+        match &req.oneof {
+            Some(proto::store_or_nodes::Oneof::Nodes(nodes)) => nodes.try_into(),
+            Some(proto::store_or_nodes::Oneof::Store(store)) => store.try_into(),
+            _ => Err(DataError::MissingField("missing store or node".to_owned())),
+        }
     }
 }
