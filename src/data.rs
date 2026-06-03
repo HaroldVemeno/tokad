@@ -9,8 +9,14 @@ pub enum DataError {
     InvalidPort(String),
     InvalidIdLength(usize),
     MissingField(String),
-    HashMismatch { expected: u128, actual: u128 },
-    TimeTravel { now: SystemTime, received: SystemTime },
+    HashMismatch {
+        expected: u128,
+        actual: u128,
+    },
+    TimeTravel {
+        now: SystemTime,
+        received: SystemTime,
+    },
 }
 
 impl std::fmt::Display for DataError {
@@ -27,7 +33,11 @@ impl std::fmt::Display for DataError {
                 expected, actual
             ),
             DataError::MissingField(msg) => write!(f, "Missing field: {}", msg),
-            DataError::TimeTravel { now, received } => write!(f, "Future timestamp: now {:?}, received {:?}", now, received),
+            DataError::TimeTravel { now, received } => write!(
+                f,
+                "Future timestamp: now {:?}, received {:?}",
+                now, received
+            ),
         }
     }
 }
@@ -188,9 +198,11 @@ impl StoreRequest {
             source: Some(stub.rep()),
             key: self.store.key.to_le_bytes().to_vec(),
             value: self.store.value,
-            publish_time: self.publish_time.duration_since(time::UNIX_EPOCH)
-                                           .unwrap_or(Duration::ZERO)
-                                           .as_millis() as u64,
+            publish_time: self
+                .publish_time
+                .duration_since(time::UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_millis() as u64,
             publish: self.publish,
         }
     }
@@ -209,7 +221,10 @@ impl proto::StoreRequest {
         let publish_time = time::UNIX_EPOCH + Duration::from_millis(self.publish_time);
         let now = SystemTime::now();
         if publish_time > now {
-            return Err(DataError::TimeTravel{received: publish_time, now})
+            return Err(DataError::TimeTravel {
+                received: publish_time,
+                now,
+            });
         }
         Ok(StoreRequest {
             store: Store {

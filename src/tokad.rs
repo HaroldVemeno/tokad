@@ -1,14 +1,13 @@
-use std::sync::Arc;
-use std::{array, time};
-use std::cmp::max;
+use std::array;
+use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 use std::net::SocketAddr;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use tokio::sync::{Mutex, mpsc::Sender};
+use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
 use tonic::transport::Endpoint;
 use tonic::{
@@ -22,6 +21,7 @@ pub mod proto {
 
 use proto::tokad_client::TokadClient;
 use proto::tokad_server::{Tokad, TokadServer};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 // Number of nodes in one bucket
 const K: usize = 4;
@@ -80,7 +80,6 @@ pub struct State {
     refresh: Mutex<[SystemTime; ID_BITS]>,
     pub store: Mutex<HashMap<u128, Data>>,
     pub start_time: SystemTime,
-    log: Option<Sender<String>>,
 }
 
 impl Default for State {
@@ -89,9 +88,9 @@ impl Default for State {
         let port = 50051;
         let now = SystemTime::now();
         let buckets: [Vec<Node>; ID_BITS] = array::from_fn(|_| Vec::with_capacity(K));
-        let refresh: [SystemTime; ID_BITS] = array::from_fn(|_| now + REFRESH.mul_f64(rand::random()));
+        let refresh: [SystemTime; ID_BITS] =
+            array::from_fn(|_| now + REFRESH.mul_f64(rand::random()));
         let store = HashMap::<u128, Data>::default();
-        let log = None;
 
         State {
             id,
@@ -100,7 +99,6 @@ impl Default for State {
             refresh: Mutex::new(refresh),
             store: Mutex::new(store),
             start_time: now,
-            log,
         }
     }
 }
@@ -203,6 +201,8 @@ impl Node {
         });
         if res.is_ok() {
             tokio::spawn(state.state.refresh(self.clone()));
+        } else {
+            tokio::spawn(state.state.retire(self.clone()));
         }
         res
     }
@@ -223,7 +223,7 @@ impl Node {
                     value: value.to_vec(),
                 },
                 publish_time,
-                publish
+                publish,
             }
             .rep(state.stub()),
         );
@@ -234,7 +234,10 @@ impl Node {
         });
         if res.is_ok() {
             tokio::spawn(state.state.refresh(self.clone()));
+        } else {
+            tokio::spawn(state.state.retire(self.clone()));
         }
+
         res
     }
 
@@ -248,7 +251,10 @@ impl Node {
         });
         if res.is_ok() {
             tokio::spawn(state.state.refresh(self.clone()));
+        } else {
+            tokio::spawn(state.state.retire(self.clone()));
         }
+
         res
     }
 
@@ -262,54 +268,15 @@ impl Node {
         });
         if res.is_ok() {
             tokio::spawn(state.state.refresh(self.clone()));
+        } else {
+            tokio::spawn(state.state.retire(self.clone()));
         }
+
         res
     }
 }
 
 impl State {
-    pub async fn log(&self, into_msg: impl Into<String>) {
-        let msg = into_msg.into();
-        if let Some(log) = &self.log {
-            if log.send(msg.clone()).await.is_err() {
-                eprintln!("{}", msg);
-            }
-        } else {
-            eprintln!("{}", msg);
-        }
-    }
-    pub async fn log_buckets(&self) {
-        {
-            let buckets = self.buckets.lock().await;
-            for (i, bt) in buckets.iter().enumerate() {
-                if !bt.is_empty() {
-                    self.log(format!(
-                        "{}: {}",
-                        i,
-                        bt.iter()
-                            .map(|n| n.to_string())
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    ))
-                    .await;
-                }
-            }
-        }
-    }
-
-    pub async fn log_store(&self) {
-        {
-            let store = self.store.lock().await;
-            for (k, v) in store.iter() {
-                if let Ok(s) = str::from_utf8(&v.data) {
-                    self.log(format!("{}: {}", k, s)).await;
-                } else {
-                    self.log(format!("{}: {:?}", k, v)).await;
-                }
-            }
-        }
-    }
-
     async fn nearest(&self, key: u128) -> Vec<Node> {
         let mut nodes: Vec<Node>;
         {
@@ -341,11 +308,12 @@ impl State {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn refresh(&self, node: Node) -> Result<(), Status> {
+        debug!("{}", node);
         if node.id == self.id || node.id == 0 {
             return Ok(());
         }
-        //self.log(format!("{:?}", node));
         let dist = node.id ^ self.id;
         let bid = (dist.leading_zeros() - ID_MASK.leading_zeros()) as usize;
         let mut test: Option<Node> = None;
@@ -356,7 +324,7 @@ impl State {
                 buckets[bid].rotate_left(1);
             }
         }
-        self.log(format!("{:?}", test)).await;
+        // trace!("{:?}", test);
 
         let mut alive = false;
         if let Some(first) = &test {
@@ -370,7 +338,9 @@ impl State {
             if let Some(i) = buckets[bid].iter().position(|n| n.id == node.id) {
                 buckets[bid].remove(i);
             }
-            if let Some(first) = test && let Some(i) = buckets[bid].iter().position(|n| n.id == first.id) {
+            if let Some(first) = test
+                && let Some(i) = buckets[bid].iter().position(|n| n.id == first.id)
+            {
                 buckets[bid].remove(i);
                 if alive {
                     buckets[bid].push(first);
@@ -389,6 +359,7 @@ impl State {
 pub type ServerResult = Result<(), tonic::transport::Error>;
 
 impl StateRef {
+    #[instrument(level = "debug", skip(self))]
     pub async fn lookup_node(&self, key: u128) -> Result<Vec<Node>, TokadError> {
         let mut queue: Vec<Node> = self.nearest(key).await;
         queue.sort_unstable_by_key(|n| n.id ^ key);
@@ -423,7 +394,7 @@ impl StateRef {
                     );
                 }
                 Err(_status) => {
-                    tokio::spawn(self.state.retire(node));
+                    // debug!(...)
                 }
             }
             while futs.len() < ALPHA && !queue.is_empty() {
@@ -440,6 +411,7 @@ impl StateRef {
         Ok(finished)
     }
 
+    #[instrument(level = "debug", skip(self))]
     pub async fn lookup_value(&self, key: u128) -> Result<StoreOrNodes, TokadError> {
         if let Some(value) = self.store.lock().await.get(&key) {
             return Ok(Store {
@@ -486,7 +458,7 @@ impl StateRef {
                     return Ok(store.or_nodes());
                 }
                 Err(_status) => {
-                    tokio::spawn(self.state.retire(node));
+                    //debug!(...)
                 }
             }
             while futs.len() < ALPHA && !queue.is_empty() {
@@ -526,9 +498,11 @@ impl StateRef {
             .lock()
             .await
             .insert(key, Data::publish(value.to_vec()));
-        self.lookup_and_store(key, value, SystemTime::now(), true).await
+        self.lookup_and_store(key, value, SystemTime::now(), true)
+            .await
     }
 
+    #[instrument(level = "info", skip(self))]
     pub async fn publish(&self, value: &[u8]) -> Result<u128, TokadError> {
         let key = key_hash(value);
         self.raw_publish(key, value).await?;
@@ -539,6 +513,7 @@ impl StateRef {
         if self.buckets.lock().await[bid].is_empty() {
             return Ok(());
         }
+        debug!("bucket {} refresh", bid);
         let keep_mask = if bid == 0 {
             0
         } else {
@@ -559,11 +534,12 @@ impl StateRef {
 
 #[tonic::async_trait]
 impl Tokad for StateRef {
+    #[instrument(level = "info", skip_all)]
     async fn ping(&self, request: Request<proto::Ping>) -> Result<Response<proto::Pong>, Status> {
         let stub = Stub::try_from(request.get_ref())?;
         let Stub { id, port } = stub;
         if let Some(loc) = request.remote_addr() {
-            self.log(format!("Ping {} {} {}", id, loc.ip(), port)).await;
+            info!("source: {} {} {}", id, loc.ip(), port);
             let node = Node {
                 id,
                 ip: loc.ip().to_string(),
@@ -571,13 +547,15 @@ impl Tokad for StateRef {
             };
             tokio::spawn(self.state.refresh(node));
         } else {
-            self.log(format!("Ping {} ? {}", id, port)).await;
+            info!("source: {} ? {}", id, port);
         }
 
         Ok(Response::new(proto::Pong {
             source: Some(self.stub().rep()),
         })) // Send back our formatted greeting
     }
+
+    #[instrument(level = "info", skip_all)]
     async fn store(
         &self,
         request: Request<proto::StoreRequest>,
@@ -585,8 +563,7 @@ impl Tokad for StateRef {
         let source = Stub::try_from(request.get_ref())?;
         let Stub { id, port } = source;
         if let Some(loc) = request.remote_addr() {
-            self.log(format!("Store: {} {} {}", id, loc.ip(), port))
-                .await;
+            info!("source: {} {} {}", id, loc.ip(), port);
             let node = Node {
                 id,
                 ip: loc.ip().to_string(),
@@ -594,7 +571,7 @@ impl Tokad for StateRef {
             };
             tokio::spawn(self.state.refresh(node));
         } else {
-            self.log(format!("Store: {} ? {}", id, port)).await;
+            info!("source: {} ? {}", id, port);
         }
 
         let StoreRequest {
@@ -603,11 +580,17 @@ impl Tokad for StateRef {
             ..
         } = request.into_inner().unrep()?;
 
-        if let Ok(string_value) = String::from_utf8(value.clone()) {
-            self.log(format!("{} -> {}", key, string_value)).await;
+        let head_count = min(40, value.len());
+        let head = if let Ok(string_value) = String::from_utf8(value[..head_count].to_vec()) {
+            if head_count == 40 {
+                string_value + "..."
+            } else {
+                string_value
+            }
         } else {
-            self.log(format!("{} -> {:?}", key, value)).await;
-        }
+            "[unprintable]".to_owned()
+        };
+        info!("{}: {}", key, head);
 
         {
             let mut store = self.store.lock().await;
@@ -624,6 +607,7 @@ impl Tokad for StateRef {
         }))
     }
 
+    #[instrument(level = "info", skip_all)]
     async fn find_node(
         &self,
         request: Request<proto::Key>,
@@ -631,8 +615,7 @@ impl Tokad for StateRef {
         let source = Stub::try_from(request.get_ref())?;
         let Stub { id, port } = source;
         if let Some(loc) = request.remote_addr() {
-            self.log(format!("Find node: {} {} {}", id, loc.ip(), port))
-                .await;
+            info!("source: {} {} {}", id, loc.ip(), port);
             let node = Node {
                 id,
                 ip: loc.ip().to_string(),
@@ -640,12 +623,12 @@ impl Tokad for StateRef {
             };
             tokio::spawn(self.state.refresh(node));
         } else {
-            self.log(format!("Find node: {} ? {}", id, port)).await;
+            info!("source: {} ? {}", id, port);
         }
 
         let Key { key } = request.into_inner().unrep()?;
 
-        self.log(format!("{}", key)).await;
+        info!("target: {}", key);
 
         Ok(Response::new(
             Nodes {
@@ -655,6 +638,7 @@ impl Tokad for StateRef {
         ))
     }
 
+    #[instrument(level = "info", skip_all)]
     async fn find_value(
         &self,
         request: Request<proto::Key>,
@@ -662,8 +646,7 @@ impl Tokad for StateRef {
         let source = Stub::try_from(request.get_ref())?;
         let Stub { id, port } = source;
         if let Some(loc) = request.remote_addr() {
-            self.log(format!("Find value: {} {} {}", id, loc.ip(), port))
-                .await;
+            info!("source: {} {} {}", id, loc.ip(), port);
             let node = Node {
                 id,
                 ip: loc.ip().to_string(),
@@ -671,17 +654,17 @@ impl Tokad for StateRef {
             };
             tokio::spawn(self.state.refresh(node));
         } else {
-            self.log(format!("Find value: {} ? {}", id, port)).await;
+            info!("source: {} ? {}", id, port);
         }
 
         let Key { key } = request.into_inner().unrep()?;
 
-        self.log(format!("Find value {}", key)).await;
+        info!("target: {}", key);
 
         {
             let store = self.store.lock().await;
             if store.contains_key(&key) {
-                self.log("Value found!".to_string()).await;
+                debug!("value found!");
                 return Ok(Response::new(
                     Store {
                         key,
@@ -704,13 +687,11 @@ impl Tokad for StateRef {
 
 pub fn start_server(
     port: u16,
-    log: Option<Sender<String>>,
     seed: Option<SocketAddr>,
 ) -> Result<(StateRef, JoinHandle<ServerResult>, JoinHandle<()>), TokadError> {
     let bind_ip = "::".parse()?;
     let bind_addr = SocketAddr::new(bind_ip, port);
     let state = Box::leak(Box::new(State::default()));
-    state.log = log;
     state.port = port;
 
     let state_ref = state.get_ref();
@@ -731,11 +712,11 @@ pub fn start_server(
                 Ok(source) => {
                     let seed_node = Node::from_stub(source, seed.ip().to_string());
                     if let Err(err) = state_ref.refresh(seed_node).await {
-                        state_ref.log(format!("Seed refresh failed: {}", err)).await;
+                        error!("Seed refresh failed: {}", err);
                         return;
                     };
                     if let Err(err) = state_ref.lookup_node(state_ref.id).await {
-                        state_ref.log(format!("Seed lookup failed: {}", err)).await;
+                        error!("Seed lookup failed: {}", err);
                         return;
                     };
                     // let mut last = 0;
@@ -754,8 +735,8 @@ pub fn start_server(
                     // }
                     // state_ref.log_buckets().await;
                 }
-                Err(e) => {
-                    state_ref.log(format!("Seed ping error: {}", e)).await;
+                Err(err) => {
+                    error!("Seed ping error: {}", err);
                 }
             }
         });
@@ -763,7 +744,7 @@ pub fn start_server(
 
     let time_loop_handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(JIFFY);
-        state_ref.log(format!("Id: {}", state_ref.id)).await;
+        info!("id: {}", state_ref.id);
         loop {
             ticker.tick().await;
 
@@ -781,20 +762,20 @@ pub fn start_server(
                     }
                 }
                 // if !to_refresh.is_empty() {
-                //     state_ref
-                //         .log(format!(
-                //             "REFRESH: {}",
+                //         debug!(
+                //             "bucket refresh: {}",
                 //             to_refresh
                 //                 .iter()
                 //                 .map(|i| i.to_string())
                 //                 .collect::<Vec<_>>()
                 //                 .join(" ")
-                //         ))
-                //         .await;
+                //         );
                 // }
                 for i in to_refresh {
                     tokio::spawn(async move {
-                        let _ = state_ref.refresh_bucket(i).await;
+                        if let Err(err) = state_ref.refresh_bucket(i).await {
+                            error!("bucket refresh error: {}", err)
+                        }
                     });
                 }
             }
@@ -823,14 +804,32 @@ pub fn start_server(
                         store.remove(&key);
                     }
                 }
+                if !to_republish.is_empty() {
+                        debug!(
+                            "republishing: {}",
+                            to_republish
+                                .iter()
+                                .map(|(k, _)| k.to_string())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        );
+                }
                 for (key, data) in to_republish {
                     tokio::spawn(async move {
-                        state_ref.lookup_and_store(key, &data.data, data.publish_time, true).await
+                        if let Err(err) = state_ref
+                            .lookup_and_store(key, &data.data, data.publish_time, true)
+                            .await {
+                            error!("Republish error: {}", err)
+                        }
                     });
                 }
                 for (key, data) in to_replicate {
                     tokio::spawn(async move {
-                        state_ref.lookup_and_store(key, &data.data, data.publish_time, false).await
+                        if let Err(err) = state_ref
+                            .lookup_and_store(key, &data.data, data.publish_time, false)
+                            .await {
+                            error!("Replicate error: {}", err)
+                        }
                     });
                 }
             }

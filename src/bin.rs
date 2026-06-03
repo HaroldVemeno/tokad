@@ -1,16 +1,15 @@
 use std::error::Error;
 use std::net::ToSocketAddrs;
-use tokio::sync::mpsc::channel;
 
 use clap::Parser;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 mod data;
 mod error;
 mod hash;
 mod tokad;
 mod tui;
-
-const LOG_CHANNEL_BUF: usize = 512;
 
 use crate::tokad::start_server;
 use crate::tui::run_tui;
@@ -47,12 +46,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     if args.daemon {
-        let (_state, server_handle, _loop_handle) = start_server(args.port, None, seed)?;
+        let filter = tracing_subscriber::filter::Targets::new()
+            .with_target("tokad::tokad", tracing_subscriber::filter::LevelFilter::INFO);
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(filter)
+            .init();
+        let (_state, server_handle, _loop_handle) = start_server(args.port, seed)?;
         server_handle.await??;
     } else {
-        let (con_snd, con_rcv) = channel(LOG_CHANNEL_BUF);
-        let (state, _server_handle, _loop_handle) = start_server(args.port, Some(con_snd), seed)?;
-        run_tui(Some(state), Some(con_rcv)).await?;
+        // Initialize tui-tracing layer and viewer with tokad::tokad module filter
+        let (tui_layer, store) = tui_tracing::TraceLayer::new();
+        let filter = tracing_subscriber::filter::Targets::new()
+            .with_target("tokad::tokad", tracing_subscriber::filter::LevelFilter::TRACE);
+        tracing_subscriber::registry()
+            .with(tui_layer)
+            .with(filter)
+            .init();
+        let mut traces = tui_tracing::TraceViewer::new(store);
+        traces.set_filter(tui_tracing::TraceFilter::all().with_min_level(tracing::Level::INFO));
+
+        let (state, _server_handle, _loop_handle) = start_server(args.port, seed)?;
+        run_tui(Some(state), traces).await?;
     }
 
     Ok(())
