@@ -72,6 +72,13 @@ impl From<std::io::Error> for TokadError {
     }
 }
 
+impl<T> From<std::sync::PoisonError<T>> for TokadError {
+    fn from(_err: std::sync::PoisonError<T>) -> Self {
+        TokadError::StorageLockPoisoned
+    }
+}
+
+
 impl From<DataError> for tonic::Status {
     fn from(err: DataError) -> Self {
         tonic::Status::invalid_argument(format!("Payload error: {}", err))

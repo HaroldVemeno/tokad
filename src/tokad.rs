@@ -7,7 +7,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
 use tonic::transport::Endpoint;
 use tonic::{
@@ -21,7 +21,7 @@ pub mod proto {
 
 use proto::tokad_client::TokadClient;
 use proto::tokad_server::{Tokad, TokadServer};
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, error, info, instrument};
 
 // Number of nodes in one bucket
 const K: usize = 4;
@@ -182,11 +182,8 @@ impl Node {
             source: Some(state.stub().rep()),
         });
 
-        let res = con.ping(req).await.and_then(|p| {
-            let inner = p.into_inner();
-            Ok(Stub::try_from(&inner)?)
-        });
-        res
+        let res = con.ping(req).await?;
+        Ok(Stub::try_from(&res.into_inner())?)
     }
 
     pub async fn ping(&self, state: StateRef) -> Result<Stub, Status> {
@@ -199,10 +196,19 @@ impl Node {
             let inner = p.into_inner();
             Ok(Stub::try_from(&inner)?)
         });
+        let self_clone = self.clone();
         if res.is_ok() {
-            tokio::spawn(state.state.refresh(self.clone()));
+            tokio::spawn(async move {
+                if let Err(e) = state.state.refresh(self_clone).await {
+                    error!("refresh error: {:?}", e);
+                }
+            });
         } else {
-            tokio::spawn(state.state.retire(self.clone()));
+            tokio::spawn(async move {
+                if let Err(e) = state.state.retire(self_clone).await {
+                    error!("retire error: {:?}", e);
+                }
+            });
         }
         res
     }
@@ -210,32 +216,29 @@ impl Node {
     async fn store(
         &self,
         state: StateRef,
-        key: u128,
-        value: &[u8],
-        publish_time: SystemTime,
-        publish: bool,
+        store_req: StoreRequest
     ) -> Result<Stub, Status> {
         let mut con = self.connect().await?;
-        let req = Request::new(
-            StoreRequest {
-                store: Store {
-                    key,
-                    value: value.to_vec(),
-                },
-                publish_time,
-                publish,
-            }
-            .rep(state.stub()),
+        let req = Request::new(store_req.rep(state.stub()),
         );
 
         let res = con.store(req).await.and_then(|p| {
             let inner = p.into_inner();
             Ok(Stub::try_from(&inner)?)
         });
+        let self_clone = self.clone();
         if res.is_ok() {
-            tokio::spawn(state.state.refresh(self.clone()));
+            tokio::spawn(async move {
+                if let Err(e) = state.state.refresh(self_clone).await {
+                    error!("refresh error: {:?}", e);
+                }
+            });
         } else {
-            tokio::spawn(state.state.retire(self.clone()));
+            tokio::spawn(async move {
+                if let Err(e) = state.state.retire(self_clone).await {
+                    error!("retire error: {:?}", e);
+                }
+            });
         }
 
         res
@@ -249,10 +252,19 @@ impl Node {
             let inner = resp.into_inner();
             Ok((Stub::try_from(&inner)?, inner.unrep()?))
         });
+        let self_clone = self.clone();
         if res.is_ok() {
-            tokio::spawn(state.state.refresh(self.clone()));
+            tokio::spawn(async move {
+                if let Err(e) = state.state.refresh(self_clone).await {
+                    error!("refresh error: {:?}", e);
+                }
+            });
         } else {
-            tokio::spawn(state.state.retire(self.clone()));
+            tokio::spawn(async move {
+                if let Err(e) = state.state.retire(self_clone).await {
+                    error!("retire error: {:?}", e);
+                }
+            });
         }
 
         res
@@ -266,10 +278,19 @@ impl Node {
             let inner = resp.into_inner();
             Ok((Stub::try_from(&inner)?, inner.unrep()?))
         });
+        let self_clone = self.clone();
         if res.is_ok() {
-            tokio::spawn(state.state.refresh(self.clone()));
+            tokio::spawn(async move {
+                if let Err(e) = state.state.refresh(self_clone).await {
+                    error!("refresh error: {:?}", e);
+                }
+            });
         } else {
-            tokio::spawn(state.state.retire(self.clone()));
+            tokio::spawn(async move {
+                if let Err(e) = state.state.retire(self_clone).await {
+                    error!("retire error: {:?}", e);
+                }
+            });
         }
 
         res
@@ -277,35 +298,40 @@ impl Node {
 }
 
 impl State {
-    async fn nearest(&self, key: u128) -> Vec<Node> {
+    async fn nearest(&self, key: u128) -> Result<Vec<Node>, TokadError> {
         let mut nodes: Vec<Node>;
         {
-            let buckets = self.buckets.lock().await;
-            nodes = buckets.iter().flatten().cloned().collect();
+            let buckets = self.buckets.lock()?;
+            let total_nodes: usize = buckets.iter().map(|b| b.len()).sum();
+            nodes = Vec::with_capacity(total_nodes);
+            for b in buckets.iter() {
+                nodes.extend(b.iter().cloned());
+            }
         }
 
         if nodes.len() <= K {
-            return nodes;
+            return Ok(nodes);
         }
         let (slice, _, _) = nodes.select_nth_unstable_by_key(K, |n| n.id ^ key);
-        slice.to_owned()
+        Ok(slice.to_owned())
     }
 
-    async fn retire(&self, node: Node) {
+    async fn retire(&self, node: Node) -> Result<(), TokadError> {
         if node.id == self.id || node.id == 0 {
-            return;
+            return Ok(());
         }
         let dist = node.id ^ self.id;
         let bid = (dist.leading_zeros() - ID_MASK.leading_zeros()) as usize;
         if bid >= ID_BITS {
-            return;
+            return Ok(());
         }
         {
-            let mut buckets = self.buckets.lock().await;
+            let mut buckets = self.buckets.lock()?;
             if let Some(i) = buckets[bid].iter().position(|n| n.id == node.id) {
                 buckets[bid].remove(i);
             }
         }
+        Ok(())
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -316,41 +342,43 @@ impl State {
         }
         let dist = node.id ^ self.id;
         let bid = (dist.leading_zeros() - ID_MASK.leading_zeros()) as usize;
-        let mut test: Option<Node> = None;
+        let test;
         {
-            let mut buckets = self.buckets.lock().await;
-            if !buckets[bid].iter().any(|n| n.id == node.id) && buckets[bid].len() == K {
-                test = Some(buckets[bid][0].clone());
-                buckets[bid].rotate_left(1);
+            let mut buckets = self.buckets.lock().map_err(|_| TokadError::StorageLockPoisoned)?;
+
+            if let Some(i) = buckets[bid].iter().position(|n| n.id == node.id) {
+                let n = buckets[bid].remove(i);
+                buckets[bid].push(n);
+                return Ok(());
             }
+
+            if buckets[bid].len() < K {
+                buckets[bid].push(node);
+                return Ok(());
+            }
+
+            test = buckets[bid][0].clone();
+            buckets[bid].rotate_left(1);
         }
-        // trace!("{:?}", test);
 
         let mut alive = false;
-        if let Some(first) = &test {
-            if first.raw_ping(self).await.is_ok() {
-                alive = true;
-            }
+        if test.raw_ping(self).await.is_ok() {
+            alive = true;
         }
 
         {
-            let mut buckets = self.buckets.lock().await;
-            if let Some(i) = buckets[bid].iter().position(|n| n.id == node.id) {
-                buckets[bid].remove(i);
-            }
-            if let Some(first) = test
-                && let Some(i) = buckets[bid].iter().position(|n| n.id == first.id)
-            {
+            let mut buckets = self.buckets.lock().map_err(|_| TokadError::StorageLockPoisoned)?;
+            if let Some(i) = buckets[bid].iter().position(|n| n.id == test.id) {
                 buckets[bid].remove(i);
                 if alive {
-                    buckets[bid].push(first);
+                    buckets[bid].push(test);
+                } else {
+                    buckets[bid].push(node);
                 }
-            }
-            if buckets[bid].len() < K {
+            } else if buckets[bid].len() < K {
                 buckets[bid].push(node);
             }
         }
-        //self.log_buckets().await;
 
         Ok(())
     }
@@ -361,7 +389,7 @@ pub type ServerResult = Result<(), tonic::transport::Error>;
 impl StateRef {
     #[instrument(level = "debug", skip(self))]
     pub async fn lookup_node(&self, key: u128) -> Result<Vec<Node>, TokadError> {
-        let mut queue: Vec<Node> = self.nearest(key).await;
+        let mut queue: Vec<Node> = self.nearest(key).await?;
         queue.sort_unstable_by_key(|n| n.id ^ key);
         let mut seen: Vec<Node> = queue.clone();
         seen.push(Node::from_stub(self.stub(), "::1"));
@@ -413,7 +441,7 @@ impl StateRef {
 
     #[instrument(level = "debug", skip(self))]
     pub async fn lookup_value(&self, key: u128) -> Result<StoreOrNodes, TokadError> {
-        if let Some(value) = self.store.lock().await.get(&key) {
+        if let Some(value) = self.store.lock()?.get(&key) {
             return Ok(Store {
                 key,
                 value: value.data.to_vec(),
@@ -421,7 +449,7 @@ impl StateRef {
             .or_nodes());
         }
 
-        let mut queue: Vec<Node> = self.nearest(key).await;
+        let mut queue: Vec<Node> = self.nearest(key).await?;
         queue.sort_unstable_by_key(|n| n.id ^ key);
         let mut seen: Vec<Node> = queue.clone();
         seen.push(Node::from_stub(self.stub(), "::1"));
@@ -487,7 +515,14 @@ impl StateRef {
             if node.id == self.id {
                 continue;
             }
-            node.store(*self, key, value, publish_time, publish).await?;
+            node.store(*self, StoreRequest{
+                store: Store{
+                    key,
+                    value: value.to_vec()
+                },
+                publish_time,
+                publish
+            }).await?;
         }
 
         Ok(())
@@ -495,8 +530,7 @@ impl StateRef {
 
     pub async fn raw_publish(&self, key: u128, value: &[u8]) -> Result<(), TokadError> {
         self.store
-            .lock()
-            .await
+            .lock()?
             .insert(key, Data::publish(value.to_vec()));
         self.lookup_and_store(key, value, SystemTime::now(), true)
             .await
@@ -510,7 +544,7 @@ impl StateRef {
     }
 
     async fn refresh_bucket(&self, bid: usize) -> Result<(), TokadError> {
-        if self.buckets.lock().await[bid].is_empty() {
+        if self.buckets.lock()?[bid].is_empty() {
             return Ok(());
         }
         debug!("bucket {} refresh", bid);
@@ -593,7 +627,7 @@ impl Tokad for StateRef {
         info!("{}: {}", key, head);
 
         {
-            let mut store = self.store.lock().await;
+            let mut store = self.store.lock().map_err(|_| TokadError::StorageLockPoisoned)?;
             if let Some(val) = store.get_mut(&key) {
                 // TODO: old value check
                 val.refresh(publish_time);
@@ -632,7 +666,7 @@ impl Tokad for StateRef {
 
         Ok(Response::new(
             Nodes {
-                nodes: self.nearest(key).await,
+                nodes: self.nearest(key).await?,
             }
             .rep(self.stub()),
         ))
@@ -662,7 +696,7 @@ impl Tokad for StateRef {
         info!("target: {}", key);
 
         {
-            let store = self.store.lock().await;
+            let store = self.store.lock().map_err(|_| TokadError::StorageLockPoisoned)?;
             if store.contains_key(&key) {
                 debug!("value found!");
                 return Ok(Response::new(
@@ -677,7 +711,7 @@ impl Tokad for StateRef {
         }
         Ok(Response::new(
             Nodes {
-                nodes: self.nearest(key).await,
+                nodes: self.nearest(key).await?,
             }
             .or_store()
             .rep(self.stub()),
@@ -713,15 +747,12 @@ pub fn start_server(
                     let seed_node = Node::from_stub(source, seed.ip().to_string());
                     if let Err(err) = state_ref.refresh(seed_node).await {
                         error!("Seed refresh failed: {}", err);
-                        return;
-                    };
-                    if let Err(err) = state_ref.lookup_node(state_ref.id).await {
+                    } else if let Err(err) = state_ref.lookup_node(state_ref.id).await {
                         error!("Seed lookup failed: {}", err);
-                        return;
                     };
                     // let mut last = 0;
                     // {
-                    //     let buckets = state_ref.buckets.lock().await;
+                    //     let buckets = state_ref.buckets.lock()?;
                     //     for i in 0..ID_BITS {
                     //         if !buckets[i].is_empty() {
                     //             last = i;
@@ -753,7 +784,7 @@ pub fn start_server(
                 let mut to_refresh = vec![];
                 let now = SystemTime::now();
                 {
-                    let mut refresh = state_ref.refresh.lock().await;
+                    let mut refresh = state_ref.refresh.lock().expect("refresh lock poisoned");
                     for i in 0..ID_BITS {
                         if refresh[i] + REFRESH < now {
                             refresh[i] = now;
@@ -787,7 +818,7 @@ pub fn start_server(
                 let mut to_republish: Vec<(u128, Data)> = vec![];
                 {
                     let mut to_expire: Vec<u128> = vec![];
-                    let mut store = state_ref.store.lock().await;
+                    let mut store = state_ref.store.lock().expect("store lock poisoned");
                     for (&key, entry) in store.iter_mut() {
                         if entry.publish && entry.publish_time + REPUBLISH <= now {
                             entry.publish_time = now;

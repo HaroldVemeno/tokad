@@ -23,7 +23,7 @@ pub enum TuiMode {
 
 #[derive(Debug)]
 pub struct Tui {
-    server: Option<StateRef>,
+    server: StateRef,
     input: Input,
     mode: TuiMode,
     console_history: Vec<String>,
@@ -33,7 +33,7 @@ pub struct Tui {
 }
 
 pub async fn run_tui(
-    server: Option<StateRef>,
+    server: StateRef,
     traces: tui_tracing::TraceViewer,
 ) -> Result<(), io::Error> {
     let (tx, rx) = mpsc::channel(100);
@@ -65,32 +65,59 @@ impl Tui {
             ..FormatOptions::default()
         });
 
+        let mut last_event_count = 0;
+        let mut should_draw = true;
         loop {
-            term.draw(|frame| self.render(frame))?;
+            if should_draw {
+                term.draw(|frame| self.render(frame))?;
+                let status = self.traces.status();
+                last_event_count = status.visible_events + status.hidden_events;
+                should_draw = false;
+            }
 
             select! {
-                _ = ticker.tick() => {}
+                _ = ticker.tick() => {
+                    let status = self.traces.status();
+                    let current_count = status.visible_events + status.hidden_events;
+                    if current_count != last_event_count {
+                        should_draw = true;
+                    }
+                }
                 Some(msg) = self.console_receiver.recv() => {
                     self.console_history.push(msg);
+                    while let Ok(msg) = self.console_receiver.try_recv() {
+                        self.console_history.push(msg);
+                    }
+                    should_draw = true;
                 }
                 Some(Ok(event)) = event_stream.next().fuse() => {
-                    if let Event::Key(key) = event {
-                        if key.code == KeyCode::Tab {
-                            self.mode = match self.mode {
-                                TuiMode::FullLogs => TuiMode::Split,
-                                TuiMode::Split => TuiMode::FullLogs,
-                            };
-                            continue;
+                    match event {
+                        Event::Key(key) => {
+                            if key.modifiers == KeyModifiers::CONTROL
+                                && key.code == KeyCode::Char('c') {
+                                return Ok(());
+                            }
+                            if key.code == KeyCode::Tab {
+                                self.mode = match self.mode {
+                                    TuiMode::FullLogs => TuiMode::Split,
+                                    TuiMode::Split => TuiMode::FullLogs,
+                                };
+                                should_draw = true;
+                                continue;
+                            }
+                            if key.code == KeyCode::Enter {
+                                let should_exit = self.enter();
+                                if should_exit { return Ok(()); }
+                                should_draw = true;
+                            } else {
+                                self.input.handle_event(&event);
+                                should_draw = true;
+                            }
                         }
-                        if key.code == KeyCode::Enter {
-                            let should_exit = self.enter();
-                            if should_exit { return Ok(()); }
+                        Event::Resize(_, _) => {
+                            should_draw = true;
                         }
-                        if key.modifiers == KeyModifiers::CONTROL
-                            && key.code == KeyCode::Char('c') {
-                            return Ok(());
-                        }
-                        self.input.handle_event(&event);
+                        _ => {}
                     }
                 }
             }
@@ -144,17 +171,10 @@ impl Tui {
             TuiMode::FullLogs => "Full Logs",
             TuiMode::Split => "Split Mode",
         };
-        let status_text = if let Some(server) = self.server {
-            format!(
+        let status_text = format!(
                 " Node ID: {} | Port: {} | Layout: {} (Press Tab to toggle)",
-                server.id, server.port, mode_str
-            )
-        } else {
-            format!(
-                " Server is dead | Layout: {} (Press Tab to toggle)",
-                mode_str
-            )
-        };
+                self.server.id, self.server.port, mode_str
+        );
 
         let status_style = ratatui::style::Style::default()
             .bg(ratatui::style::Color::DarkGray)
@@ -229,14 +249,13 @@ impl Tui {
                 self.console_history
                     .push(format!("Ping destination: {}", sock));
                 let node = Node::from_sock(0, sock);
-                if let Some(server) = self.server {
+                {
                     let tx = self.console_sender.clone();
+                    let server = self.server;
                     tokio::spawn(async move {
                         let res = node.ping(server).await;
                         let _ = tx.send(format!("Ping result: {:?}", res)).await;
                     });
-                } else {
-                    self.console_history.push("Server is dead".to_string());
                 }
             }
 
@@ -251,14 +270,13 @@ impl Tui {
                     self.console_history.push("Unparseable key".to_string());
                     return false;
                 };
-                if let Some(server) = self.server {
+                {
                     let tx = self.console_sender.clone();
+                    let server = self.server;
                     tokio::spawn(async move {
                         let res = server.lookup_node(key).await;
                         let _ = tx.send(format!("Lookup result: {:?}", res)).await;
                     });
-                } else {
-                    self.console_history.push("Server is dead".to_string());
                 }
             }
 
@@ -273,8 +291,9 @@ impl Tui {
                     self.console_history.push("Unparseable key".to_string());
                     return false;
                 };
-                if let Some(server) = self.server {
+                {
                     let tx = self.console_sender.clone();
+                    let server = self.server;
                     tokio::spawn(async move {
                         match server.lookup_value(key).await {
                             Ok(StoreOrNodes::Store(store)) => {
@@ -290,8 +309,6 @@ impl Tui {
                             }
                         }
                     });
-                } else {
-                    self.console_history.push("Server is dead".to_string());
                 }
             }
             "local_store" => {
@@ -306,18 +323,17 @@ impl Tui {
                     return false;
                 };
                 let value = words[2].bytes().collect();
-                if let Some(server) = self.server {
+                {
                     let tx = self.console_sender.clone();
+                    let server = self.server;
                     tokio::spawn(async move {
                         server
                             .store
                             .lock()
-                            .await
+                            .unwrap()
                             .insert(key, Data::new(value, SystemTime::now()));
                         let _ = tx.send("Stored".to_string()).await;
                     });
-                } else {
-                    self.console_history.push("Server is dead".to_string());
                 }
             }
             "raw_store" => {
@@ -332,14 +348,13 @@ impl Tui {
                     return false;
                 };
                 let value: Vec<u8> = words[2].bytes().collect();
-                if let Some(server) = self.server {
+                {
                     let tx = self.console_sender.clone();
+                    let server = self.server;
                     tokio::spawn(async move {
                         let res = server.raw_publish(key, &value).await;
                         let _ = tx.send(format!("Store result: {:?}", res)).await;
                     });
-                } else {
-                    self.console_history.push("Server is dead".to_string());
                 }
             }
             "store" => {
@@ -350,8 +365,9 @@ impl Tui {
                 }
 
                 let value: Vec<u8> = words[1].bytes().collect();
-                if let Some(server) = self.server {
+                {
                     let tx = self.console_sender.clone();
+                    let server = self.server;
                     tokio::spawn(async move {
                         match server.publish(&value).await {
                             Ok(key) => {
@@ -362,8 +378,6 @@ impl Tui {
                             }
                         }
                     });
-                } else {
-                    self.console_history.push("Server is dead".to_string());
                 }
             }
             "print" => {
@@ -374,53 +388,65 @@ impl Tui {
                     );
                     return false;
                 }
-                if let Some(server) = self.server {
+                {
                     match words[1] {
                         "id" => {
-                            self.console_history.push(format!("id: {}", server.id));
+                            self.console_history.push(format!("id: {}", self.server.id));
                         }
                         "port" => {
-                            self.console_history.push(format!("port: {}", server.port));
+                            self.console_history.push(format!("port: {}", self.server.port));
                         }
                         "buckets" => {
                             let tx = self.console_sender.clone();
+                            let server = self.server;
                             tokio::spawn(async move {
-                                let buckets = server.buckets.lock().await;
-                                for (i, bt) in buckets.iter().enumerate() {
-                                    if !bt.is_empty() {
-                                        let nodes_str = bt
-                                            .iter()
-                                            .map(|n| n.to_string())
-                                            .collect::<Vec<_>>()
-                                            .join(" ");
-                                        let _ = tx.send(format!("{}: {}", i, nodes_str)).await;
+                                let mut lines = Vec::new();
+                                {
+                                    let buckets = server.buckets.lock().unwrap();
+                                    for (i, bt) in buckets.iter().enumerate() {
+                                        if !bt.is_empty() {
+                                            let nodes_str = bt
+                                                .iter()
+                                                .map(|n| n.to_string())
+                                                .collect::<Vec<_>>()
+                                                .join(" ");
+                                            lines.push((i, nodes_str));
+                                        }
                                     }
+                                }
+                                for (i, nodes_str) in lines {
+                                    let _ = tx.send(format!("{}: {}", i, nodes_str)).await;
                                 }
                             });
                         }
                         "store" => {
                             let tx = self.console_sender.clone();
+                            let server = self.server;
                             tokio::spawn(async move {
-                                let store = server.store.lock().await;
-                                for (k, v) in store.iter() {
-                                    if let Ok(s) = std::str::from_utf8(&v.data) {
-                                        let _ = tx.send(format!("{}: {}", k, s)).await;
-                                    } else {
-                                        let _ = tx.send(format!("{}: {:?}", k, v.data)).await;
+                                let mut lines = Vec::new();
+                                {
+                                    let store = server.store.lock().unwrap();
+                                    for (k, v) in store.iter() {
+                                        if let Ok(s) = std::str::from_utf8(&v.data) {
+                                            lines.push(format!("{}: {}", k, s));
+                                        } else {
+                                            lines.push(format!("{}: {:?}", k, v.data));
+                                        }
                                     }
+                                }
+                                for line in lines {
+                                    let _ = tx.send(line).await;
                                 }
                             });
                         }
                         "start_time" => {
                             self.console_history
-                                .push(format!("start_time: {:?}", server.start_time));
+                                .push(format!("start_time: {:?}", self.server.start_time));
                         }
                         _ => {
                             self.console_history.push("Unknown thing to print. Usage: print id|port|buckets|store|start_time".to_string());
                         }
                     }
-                } else {
-                    self.console_history.push("Server is dead".to_string());
                 }
             }
             _ => {
