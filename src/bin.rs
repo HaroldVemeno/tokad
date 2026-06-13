@@ -25,9 +25,12 @@ struct Args {
     verbose: bool,
     #[arg(short, long)]
     daemon: bool,
+    #[arg(short = 'c', long)]
+    tokio_console: bool,
 }
 
-#[tokio::main(flavor = "current_thread")]
+// #[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     use tracing_subscriber::Layer;
 
@@ -52,8 +55,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .with_target("tokad::tokad", tracing_subscriber::filter::LevelFilter::INFO);
 
         #[cfg(all(tokio_unstable, feature = "tokio-console"))]
+        let console_layer = if args.tokio_console {
+            Some(console_subscriber::ConsoleLayer::builder().with_default_env().spawn())
+        } else {
+            None
+        };
+
+        #[cfg(all(tokio_unstable, feature = "tokio-console"))]
         let registry = tracing_subscriber::registry()
-            .with(console_subscriber::ConsoleLayer::builder().with_default_env().spawn())
+            .with(console_layer)
             .with(tracing_subscriber::fmt::layer().with_filter(filter));
 
         #[cfg(not(all(tokio_unstable, feature = "tokio-console")))]
@@ -65,13 +75,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         server_handle.await??;
     } else {
         // Initialize tui-tracing layer and viewer with tokad::tokad module filter
-        let (tui_layer, store) = tui_tracing::TraceLayer::new();
+        let store = tui_tracing::TraceStore::with_capacity(150);
+        let tui_layer = tui_tracing::TraceLayer::from_store(store.clone());
         let filter = tracing_subscriber::filter::Targets::new()
             .with_target("tokad::tokad", tracing_subscriber::filter::LevelFilter::TRACE);
 
         #[cfg(all(tokio_unstable, feature = "tokio-console"))]
+        let console_layer = if args.tokio_console {
+            Some(console_subscriber::ConsoleLayer::builder().with_default_env().spawn())
+        } else {
+            None
+        };
+
+        #[cfg(all(tokio_unstable, feature = "tokio-console"))]
         let registry = tracing_subscriber::registry()
-            .with(console_subscriber::ConsoleLayer::builder().with_default_env().spawn())
+            .with(console_layer)
             .with(tui_layer.with_filter(filter));
 
         #[cfg(not(all(tokio_unstable, feature = "tokio-console")))]

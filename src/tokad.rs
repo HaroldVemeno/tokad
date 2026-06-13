@@ -71,14 +71,15 @@ impl Data {
 pub use crate::data::{Key, Node, Nodes, Store, StoreOrNodes, StoreRequest, Stub};
 use crate::error::TokadError;
 use crate::hash::{ID_BITS, ID_MASK, key_hash};
+use crossbeam_utils::CachePadded;
 
 #[derive(Debug)]
 pub struct State {
     pub id: u128,
     pub port: u16,
-    pub buckets: Mutex<[Vec<Node>; ID_BITS]>,
-    refresh: Mutex<[SystemTime; ID_BITS]>,
-    pub store: Mutex<HashMap<u128, Data>>,
+    pub buckets: CachePadded<Mutex<[Vec<Node>; ID_BITS]>>,
+    refresh: CachePadded<Mutex<[SystemTime; ID_BITS]>>,
+    pub store: CachePadded<Mutex<HashMap<u128, Data>>>,
     pub start_time: SystemTime,
 }
 
@@ -95,9 +96,9 @@ impl Default for State {
         State {
             id,
             port,
-            buckets: Mutex::new(buckets),
-            refresh: Mutex::new(refresh),
-            store: Mutex::new(store),
+            buckets: CachePadded::new(Mutex::new(buckets)),
+            refresh: CachePadded::new(Mutex::new(refresh)),
+            store: CachePadded::new(Mutex::new(store)),
             start_time: now,
         }
     }
@@ -156,11 +157,11 @@ impl Node {
             port: stub.port,
         }
     }
-    async fn connect(&self) -> Result<TokadClient<Channel>, Status> {
+    async fn connect(&self) -> Result<TokadClient<Channel>, TokadError> {
         let sock = self.sock().ok_or_else(|| {
-            Status::invalid_argument("Invalid or unparseable IP/port in node metadata")
+            TokadError::NetworkStatus(Status::invalid_argument("Invalid or unparseable IP/port in node metadata"))
         })?;
-        TokadClient::connect(
+        let client = TokadClient::connect(
             Endpoint::from(
                 Uri::builder()
                     .scheme("http")
@@ -173,10 +174,11 @@ impl Node {
             .timeout(Duration::from_secs(1)),
         )
         .await
-        .map_err(|err| Status::from_error(Box::new(err)))
+        .map_err(|err| TokadError::NetworkStatus(Status::from_error(Box::new(err))))?;
+        Ok(client)
     }
 
-    pub async fn raw_ping(&self, state: &State) -> Result<Stub, Status> {
+    pub async fn raw_ping(&self, state: &State) -> Result<Stub, TokadError> {
         let mut con = self.connect().await?;
         let req = Request::new(proto::Ping {
             source: Some(state.stub().rep()),
@@ -186,16 +188,22 @@ impl Node {
         Ok(Stub::try_from(&res.into_inner())?)
     }
 
-    pub async fn ping(&self, state: StateRef) -> Result<Stub, Status> {
+    pub async fn ping(&self, state: StateRef) -> Result<Stub, TokadError> {
         let mut con = self.connect().await?;
         let req = Request::new(proto::Ping {
             source: Some(state.stub().rep()),
         });
 
-        let res = con.ping(req).await.and_then(|p| {
-            let inner = p.into_inner();
-            Ok(Stub::try_from(&inner)?)
-        });
+        let res = match con.ping(req).await {
+            Ok(p) => {
+                let inner = p.into_inner();
+                match Stub::try_from(&inner) {
+                    Ok(stub) => Ok(stub),
+                    Err(e) => Err(TokadError::from(e)),
+                }
+            }
+            Err(status) => Err(TokadError::from(status)),
+        };
         let self_clone = self.clone();
         if res.is_ok() {
             tokio::spawn(async move {
@@ -217,15 +225,21 @@ impl Node {
         &self,
         state: StateRef,
         store_req: StoreRequest
-    ) -> Result<Stub, Status> {
+    ) -> Result<Stub, TokadError> {
         let mut con = self.connect().await?;
         let req = Request::new(store_req.rep(state.stub()),
         );
 
-        let res = con.store(req).await.and_then(|p| {
-            let inner = p.into_inner();
-            Ok(Stub::try_from(&inner)?)
-        });
+        let res = match con.store(req).await {
+            Ok(p) => {
+                let inner = p.into_inner();
+                match Stub::try_from(&inner) {
+                    Ok(stub) => Ok(stub),
+                    Err(e) => Err(TokadError::from(e)),
+                }
+            }
+            Err(status) => Err(TokadError::from(status)),
+        };
         let self_clone = self.clone();
         if res.is_ok() {
             tokio::spawn(async move {
@@ -244,14 +258,23 @@ impl Node {
         res
     }
 
-    async fn find_node(&self, state: StateRef, key: u128) -> Result<(Stub, Nodes), Status> {
+    async fn find_node(&self, state: StateRef, key: u128) -> Result<(Stub, Nodes), TokadError> {
         let mut con = self.connect().await?;
         let req = Request::new(Key { key }.rep(state.stub()));
 
-        let res = con.find_node(req).await.and_then(|resp| {
-            let inner = resp.into_inner();
-            Ok((Stub::try_from(&inner)?, inner.unrep()?))
-        });
+        let res = match con.find_node(req).await {
+            Ok(resp) => {
+                let inner = resp.into_inner();
+                match Stub::try_from(&inner) {
+                    Ok(stub) => match inner.unrep() {
+                        Ok(nodes) => Ok((stub, nodes)),
+                        Err(e) => Err(TokadError::from(e)),
+                    },
+                    Err(e) => Err(TokadError::from(e)),
+                }
+            }
+            Err(status) => Err(TokadError::from(status)),
+        };
         let self_clone = self.clone();
         if res.is_ok() {
             tokio::spawn(async move {
@@ -270,14 +293,23 @@ impl Node {
         res
     }
 
-    async fn find_value(&self, state: StateRef, key: u128) -> Result<(Stub, StoreOrNodes), Status> {
+    async fn find_value(&self, state: StateRef, key: u128) -> Result<(Stub, StoreOrNodes), TokadError> {
         let mut con = self.connect().await?;
         let req = Request::new(Key { key }.rep(state.stub()));
 
-        let res = con.find_value(req).await.and_then(|resp| {
-            let inner = resp.into_inner();
-            Ok((Stub::try_from(&inner)?, inner.unrep()?))
-        });
+        let res = match con.find_value(req).await {
+            Ok(resp) => {
+                let inner = resp.into_inner();
+                match Stub::try_from(&inner) {
+                    Ok(stub) => match inner.unrep() {
+                        Ok(store_or_nodes) => Ok((stub, store_or_nodes)),
+                        Err(e) => Err(TokadError::from(e)),
+                    },
+                    Err(e) => Err(TokadError::from(e)),
+                }
+            }
+            Err(status) => Err(TokadError::from(status)),
+        };
         let self_clone = self.clone();
         if res.is_ok() {
             tokio::spawn(async move {
@@ -421,7 +453,7 @@ impl StateRef {
                         node,
                     );
                 }
-                Err(_status) => {
+                Err(_err) => {
                     // debug!(...)
                 }
             }
@@ -485,7 +517,7 @@ impl StateRef {
                     futs.shutdown().await;
                     return Ok(store.or_nodes());
                 }
-                Err(_status) => {
+                Err(_err) => {
                     //debug!(...)
                 }
             }

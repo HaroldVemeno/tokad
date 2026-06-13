@@ -9,11 +9,13 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Layout},
-    widgets::Paragraph,
+    widgets::{Clear, Paragraph},
 };
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 use tui_tracing::FormatOptions;
+
+use circular_queue::CircularQueue;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TuiMode {
@@ -26,7 +28,7 @@ pub struct Tui {
     server: StateRef,
     input: Input,
     mode: TuiMode,
-    console_history: Vec<String>,
+    console_history: CircularQueue<String>,
     console_sender: mpsc::Sender<String>,
     console_receiver: mpsc::Receiver<String>,
     traces: tui_tracing::TraceViewer,
@@ -41,7 +43,7 @@ pub async fn run_tui(
         server,
         input: Input::default(),
         mode: TuiMode::Split,
-        console_history: Vec::new(),
+        console_history: CircularQueue::with_capacity(1000),
         console_sender: tx,
         console_receiver: rx,
         traces,
@@ -56,7 +58,7 @@ pub async fn run_tui(
 impl Tui {
     async fn run(mut self, term: &mut DefaultTerminal) -> io::Result<()> {
         let mut event_stream = EventStream::new();
-        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(66));
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
 
         self.traces.set_format_options(FormatOptions {
             show_span_context: true,
@@ -65,59 +67,80 @@ impl Tui {
             ..FormatOptions::default()
         });
 
-        let mut last_event_count = 0;
+        let mut last_captured_events = 0;
         let mut should_draw = true;
         loop {
             if should_draw {
                 term.draw(|frame| self.render(frame))?;
-                let status = self.traces.status();
-                last_event_count = status.visible_events + status.hidden_events;
+                let store_status = self.traces.store().status();
+                last_captured_events = store_status.captured_events;
                 should_draw = false;
             }
 
             select! {
                 _ = ticker.tick() => {
-                    let status = self.traces.status();
-                    let current_count = status.visible_events + status.hidden_events;
-                    if current_count != last_event_count {
+                    let store_status = self.traces.store().status();
+                    let current_captured = store_status.captured_events;
+                    if current_captured != last_captured_events {
                         should_draw = true;
                     }
                 }
-                Some(msg) = self.console_receiver.recv() => {
-                    self.console_history.push(msg);
-                    while let Ok(msg) = self.console_receiver.try_recv() {
+                msg = self.console_receiver.recv() => {
+                    if let Some(msg) = msg {
                         self.console_history.push(msg);
+                        while let Ok(msg) = self.console_receiver.try_recv() {
+                            self.console_history.push(msg);
+                        }
+                        should_draw = true;
+                    } else {
+                        break Ok(());
                     }
-                    should_draw = true;
                 }
-                Some(Ok(event)) = event_stream.next().fuse() => {
+                event = event_stream.next().fuse() => {
                     match event {
-                        Event::Key(key) => {
-                            if key.modifiers == KeyModifiers::CONTROL
-                                && key.code == KeyCode::Char('c') {
-                                return Ok(());
-                            }
-                            if key.code == KeyCode::Tab {
-                                self.mode = match self.mode {
-                                    TuiMode::FullLogs => TuiMode::Split,
-                                    TuiMode::Split => TuiMode::FullLogs,
-                                };
-                                should_draw = true;
-                                continue;
-                            }
-                            if key.code == KeyCode::Enter {
-                                let should_exit = self.enter();
-                                if should_exit { return Ok(()); }
-                                should_draw = true;
-                            } else {
-                                self.input.handle_event(&event);
-                                should_draw = true;
+                        Some(Ok(event)) => {
+                            match event {
+                                Event::Key(key) => {
+                                    if key.kind == crossterm::event::KeyEventKind::Release {
+                                        continue;
+                                    }
+                                    if key.modifiers == KeyModifiers::CONTROL
+                                        && key.code == KeyCode::Char('c') {
+                                        return Ok(());
+                                    }
+                                    if key.code == KeyCode::Tab {
+                                        if key.kind != crossterm::event::KeyEventKind::Press {
+                                            continue;
+                                        }
+                                        self.mode = match self.mode {
+                                            TuiMode::FullLogs => TuiMode::Split,
+                                            TuiMode::Split => TuiMode::FullLogs,
+                                        };
+                                        should_draw = true;
+                                        continue;
+                                    }
+                                    if key.code == KeyCode::Enter {
+                                        if key.kind != crossterm::event::KeyEventKind::Press {
+                                            continue;
+                                        }
+                                        let should_exit = self.enter();
+                                        if should_exit { return Ok(()); }
+                                        should_draw = true;
+                                    } else {
+                                        self.input.handle_event(&event);
+                                        should_draw = true;
+                                    }
+                                }
+                                Event::Resize(_, _) => {
+                                    term.clear()?;
+                                    should_draw = true;
+                                }
+                                _ => {}
                             }
                         }
-                        Event::Resize(_, _) => {
-                            should_draw = true;
+                        Some(Err(_)) | None => {
+                            break Ok(());
                         }
-                        _ => {}
                     }
                 }
             }
@@ -125,70 +148,125 @@ impl Tui {
     }
 
     fn render(&mut self, frame: &mut Frame) {
-        let areas = match self.mode {
-            TuiMode::FullLogs => {
-                let chunks: [ratatui::layout::Rect; 3] = Layout::vertical([
-                    Constraint::Fill(1),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                ])
-                .areas(frame.area());
-                (chunks[0], None, chunks[1], chunks[2])
-            }
-            TuiMode::Split => {
-                let chunks: [ratatui::layout::Rect; 4] = Layout::vertical([
-                    Constraint::Fill(1),
-                    Constraint::Fill(1),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                ])
-                .areas(frame.area());
-                (chunks[0], Some(chunks[1]), chunks[2], chunks[3])
+        let height = frame.area().height;
+        let (log_area, console_area_opt, status_area, input_area) = if height <= 1 {
+            // Only input area is visible if height is extremely constrained
+            (
+                ratatui::layout::Rect::default(),
+                None,
+                ratatui::layout::Rect::default(),
+                frame.area(),
+            )
+        } else if height == 2 {
+            // Only status bar and input area are visible
+            let chunks: [ratatui::layout::Rect; 2] = Layout::vertical([
+                Constraint::Length(1), // Status
+                Constraint::Length(1), // Input
+            ])
+            .areas(frame.area());
+            (
+                ratatui::layout::Rect::default(),
+                None,
+                chunks[0],
+                chunks[1],
+            )
+        } else {
+            // Normal layout division for height >= 3
+            match self.mode {
+                TuiMode::FullLogs => {
+                    let chunks: [ratatui::layout::Rect; 3] = Layout::vertical([
+                        Constraint::Fill(1),
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                    ])
+                    .areas(frame.area());
+                    (chunks[0], None, chunks[1], chunks[2])
+                }
+                TuiMode::Split => {
+                    let chunks: [ratatui::layout::Rect; 4] = Layout::vertical([
+                        Constraint::Fill(1),
+                        Constraint::Fill(1),
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                    ])
+                    .areas(frame.area());
+                    (chunks[0], Some(chunks[1]), chunks[2], chunks[3])
+                }
             }
         };
 
-        let (log_area, console_area_opt, status_area, input_area) = areas;
-
-        // Render logs using tui-tracing
-        frame.render_widget(&mut self.traces, log_area);
-
-        // Render console area if in Split mode
-        if let Some(console_area) = console_area_opt {
-            let rows = console_area.height as usize;
-            let start = self.console_history.len().saturating_sub(rows);
-            let text = ratatui::text::Text::from_iter(
-                self.console_history[start..]
-                    .iter()
-                    .map(|s| ratatui::text::Line::raw(s.clone())),
-            );
-            let console_paragraph =
-                Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: true });
-            frame.render_widget(console_paragraph, console_area);
+        // Render logs if there is height
+        if log_area.height > 0 {
+            frame.render_widget(&mut self.traces, log_area);
         }
 
-        // Render status bar (clean, borderless status bar)
-        let mode_str = match self.mode {
-            TuiMode::FullLogs => "Full Logs",
-            TuiMode::Split => "Split Mode",
-        };
-        let status_text = format!(
+        // Render console area if in Split mode and has height
+        if let Some(console_area) = console_area_opt {
+            if console_area.height > 0 {
+                frame.render_widget(Clear, console_area);
+                let rows = console_area.height as usize;
+                let width = console_area.width as usize;
+
+                let mut wrapped_lines = Vec::new();
+                for s in self.console_history.iter() {
+                    let lines = wrap_text(s, width);
+                    wrapped_lines.splice(0..0, lines);
+                    if wrapped_lines.len() >= rows {
+                        break;
+                    }
+                }
+
+                let start = wrapped_lines.len().saturating_sub(rows);
+                let text = ratatui::text::Text::from_iter(
+                    wrapped_lines.iter().skip(start)
+                        .map(|s| ratatui::text::Line::raw(s.clone())),
+                );
+                let console_paragraph = Paragraph::new(text);
+                frame.render_widget(console_paragraph, console_area);
+            }
+        }
+
+        // Render status bar if it has height
+        if status_area.height > 0 {
+            let mode_str = match self.mode {
+                TuiMode::FullLogs => "Full Logs",
+                TuiMode::Split => "Split Mode",
+            };
+            let status_width = status_area.width as usize;
+            let mut status_text = format!(
                 " Node ID: {} | Port: {} | Layout: {} (Press Tab to toggle)",
                 self.server.id, self.server.port, mode_str
-        );
+            );
+            if status_text.len() > status_width {
+                status_text.truncate(status_width);
+            } else {
+                status_text.push_str(&" ".repeat(status_width - status_text.len()));
+            }
 
-        let status_style = ratatui::style::Style::default()
-            .bg(ratatui::style::Color::DarkGray)
-            .fg(ratatui::style::Color::White);
+            let status_style = ratatui::style::Style::default()
+                .bg(ratatui::style::Color::DarkGray)
+                .fg(ratatui::style::Color::White);
 
-        let status_paragraph = Paragraph::new(status_text).style(status_style);
-        frame.render_widget(status_paragraph, status_area);
+            let status_paragraph = Paragraph::new(status_text).style(status_style);
+            frame.render_widget(status_paragraph, status_area);
+        }
 
-        // Render input area
-        frame.render_widget(self.input.value(), input_area);
+        // Render input area if it has height
+        if input_area.height > 0 {
+            let mut input_area = input_area;
+            if input_area.width > 1 {
+                input_area.width -= 1; // Prevent writing to bottom-right cell to avoid auto-scrolling
+            }
+            frame.render_widget(Clear, input_area);
+            let input_width = input_area.width as usize;
+            let scroll = self.input.visual_scroll(input_width);
+            let display_value: String = self.input.value().chars().skip(scroll).take(input_width).collect();
+            let input_paragraph = Paragraph::new(display_value);
+            frame.render_widget(input_paragraph, input_area);
 
-        let scroll = self.input.visual_scroll(input_area.width as usize);
-        let x = self.input.visual_cursor().max(scroll) - scroll;
-        frame.set_cursor_position((input_area.x + x as u16, input_area.y));
+            let x = self.input.visual_cursor().max(scroll) - scroll;
+            frame.set_cursor_position((input_area.x + x as u16, input_area.y));
+        }
     }
 
     fn enter(&mut self) -> bool {
@@ -458,4 +536,36 @@ impl Tui {
 
         false
     }
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![];
+    }
+    if text.len() <= width && !text.contains('\n') {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut current_line = String::new();
+        for word in line.split(' ') {
+            if current_line.is_empty() {
+                current_line.push_str(word);
+            } else if current_line.len() + 1 + word.len() <= width {
+                current_line.push(' ');
+                current_line.push_str(word);
+            } else {
+                lines.push(current_line);
+                current_line = word.to_string();
+            }
+        }
+        if !current_line.is_empty() {
+            lines.push(current_line);
+        }
+    }
+    lines
 }
